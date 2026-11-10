@@ -18,6 +18,7 @@ use Illuminate\Support\Carbon;
  * @property int $id
  * @property int $organization_id
  * @property int $product_id
+ *  * @property int|null $warehouse_id
  * @property string $serial_number
  * @property string $status
  * @property string|null $notes
@@ -70,11 +71,12 @@ class ProductSerial extends Model
      * @var array<int, string>
      */
     protected $fillable = [
-        'organization_id',
-        'product_id',
-        'serial_number',
-        'status',
-        'notes',
+    'organization_id',
+    'product_id',
+    'warehouse_id',
+    'serial_number',
+    'status',
+    'notes',
     ];
 
     // order_item_id is deliberately NOT fillable: it links a serial to the

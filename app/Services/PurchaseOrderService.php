@@ -6,6 +6,7 @@ namespace App\Services;
 
 use App\Exceptions\InvalidStateException;
 use App\Models\Inventory\Product;
+use App\Models\Inventory\ProductSerial;
 use App\Models\Inventory\ProductVariant;
 use App\Models\Inventory\Supplier;
 use App\Models\Purchasing\PurchaseOrder;
@@ -146,57 +147,156 @@ final class PurchaseOrderService
 
         return $purchaseOrder->fresh();
     }
+/**
+ * Receive quantities against a sent/partial purchase order.
+ *
+ * @param  array<int, array{
+ *     id: int,
+ *     quantity_to_receive: int,
+ *     barcodes?: array<int, string>
+ * }> $items
+ * @return int the number of lines that received stock
+ *
+ * @throws InvalidStateException when the PO cannot receive items
+ */
+public function receive(PurchaseOrder $purchaseOrder, User $actor, array $items): int
+{
+    // Goods land in the line's designated location, falling back to the
+    // product's primary location for legacy/manual lines.
+    $this->warehouseAccess->authorizeReceiving($actor, $purchaseOrder, $items);
 
-    /**
-     * Receive quantities against a sent/partial purchase order.
-     *
-     * @param  array<int, array{id: int, quantity_to_receive: int}>  $items
-     * @return int the number of lines that received stock
-     *
-     * @throws InvalidStateException when the PO cannot receive items
-     */
-    public function receive(PurchaseOrder $purchaseOrder, User $actor, array $items): int
-    {
-        // Goods land in the line's designated location, falling back to the
-        // product's primary location for legacy/manual lines.
-        $this->warehouseAccess->authorizeReceiving($actor, $purchaseOrder, $items);
+    if (! $purchaseOrder->canReceiveItems()) {
+        throw new InvalidStateException(
+            'This purchase order cannot receive items.',
+            'cannot_receive'
+        );
+    }
 
-        if (! $purchaseOrder->canReceiveItems()) {
-            throw new InvalidStateException('This purchase order cannot receive items.', 'cannot_receive');
+    $receivedCount = 0;
+
+    DB::transaction(function () use ($items, $purchaseOrder, &$receivedCount) {
+        // Lock the PO so concurrent receiving attempts cannot over-receive.
+        $po = PurchaseOrder::whereKey($purchaseOrder->getKey())
+            ->lockForUpdate()
+            ->firstOrFail();
+
+        if (! $po->canReceiveItems()) {
+            throw new InvalidStateException(
+                'This purchase order cannot receive items.',
+                'cannot_receive'
+            );
         }
 
-        $receivedCount = 0;
+        foreach ($items as $itemData) {
+            $quantityToReceive = (int) $itemData['quantity_to_receive'];
 
-        DB::transaction(function () use ($items, $purchaseOrder, &$receivedCount) {
-            // Re-read the PO under a row lock so two concurrent receive calls
-            // (a double-submit, a retried timeout, or two integration workers)
-            // serialize here; the second observes the post-receive
-            // status/quantities instead of the same stale pre-image, which
-            // otherwise let both book stock and over-receive up to 2x. Each
-            // item is likewise locked before receive().
-            $po = PurchaseOrder::whereKey($purchaseOrder->getKey())->lockForUpdate()->firstOrFail();
-
-            if (! $po->canReceiveItems()) {
-                throw new InvalidStateException('This purchase order cannot receive items.', 'cannot_receive');
+            if ($quantityToReceive <= 0) {
+                continue;
             }
 
-            foreach ($items as $itemData) {
-                if ($itemData['quantity_to_receive'] > 0) {
-                    $item = PurchaseOrderItem::where('id', $itemData['id'])
-                        ->where('purchase_order_id', $po->id)
-                        ->lockForUpdate()
-                        ->first();
+            $item = PurchaseOrderItem::where('id', $itemData['id'])
+                ->where('purchase_order_id', $po->id)
+                ->lockForUpdate()
+                ->first();
 
-                    if ($item && $item->remaining_quantity > 0) {
-                        $item->receive($itemData['quantity_to_receive']);
-                        $receivedCount++;
-                    }
+            if (! $item || $item->remaining_quantity <= 0) {
+                continue;
+            }
+
+            /*
+             * For the physical-barcode workflow, the number of scanned
+             * barcodes must exactly equal the quantity being received.
+             */
+            $barcodes = array_values(
+                array_filter(
+                    array_map(
+                        static fn ($barcode) => trim((string) $barcode),
+                        $itemData['barcodes'] ?? []
+                    ),
+                    static fn ($barcode) => $barcode !== ''
+                )
+            );
+
+            if (count($barcodes) !== $quantityToReceive) {
+                throw new InvalidStateException(
+                    "Barcode count does not match the receiving quantity for {$item->product_name}.",
+                    'barcode_quantity_mismatch'
+                );
+            }
+
+            /*
+             * Prevent duplicate physical barcodes in the same request.
+             */
+            if (count($barcodes) !== count(array_unique($barcodes))) {
+                throw new InvalidStateException(
+                    "Duplicate barcode detected for {$item->product_name}.",
+                    'duplicate_barcode'
+                );
+            }
+
+            /*
+             * Determine the warehouse from the purchase-order receiving
+             * location. Your receiving page already loads
+             * receivingLocation.warehouse.
+             */
+            $item->loadMissing('receivingLocation.warehouse');
+
+            $warehouseId = $item->receivingLocation?->warehouse_id;
+
+            if (! $warehouseId) {
+                throw new InvalidStateException(
+                    "No warehouse is assigned to the receiving location for {$item->product_name}.",
+                    'missing_receiving_warehouse'
+                );
+            }
+
+            /*
+             * Check every physical barcode before changing stock.
+             *
+             * ProductSerial has a tenant-level unique constraint on
+             * organization_id + serial_number, so the same manufacturer
+             * barcode cannot exist twice in this organization.
+             */
+            foreach ($barcodes as $barcode) {
+                $alreadyExists = ProductSerial::where('organization_id', $po->organization_id)
+                    ->where('serial_number', $barcode)
+                    ->exists();
+
+                if ($alreadyExists) {
+                    throw new InvalidStateException(
+                        "Barcode already exists in inventory: {$barcode}",
+                        'duplicate_existing_barcode'
+                    );
                 }
             }
-        });
 
-        return $receivedCount;
-    }
+            /*
+             * Create the physical serial records using the ACTUAL
+             * manufacturer barcodes scanned at the godown.
+             */
+            foreach ($barcodes as $barcode) {
+                ProductSerial::create([
+                    'organization_id' => $po->organization_id,
+                    'product_id' => $item->product_id,
+                    'warehouse_id' => $warehouseId,
+                    'serial_number' => $barcode,
+                    'status' => ProductSerial::STATUS_AVAILABLE,
+                ]);
+            }
+
+            /*
+             * Keep Inventoros' normal stock receiving logic.
+             * The serial records above identify the exact physical units;
+             * receive() updates the PO quantity/stock as before.
+             */
+            $item->receive($quantityToReceive);
+
+            $receivedCount++;
+        }
+    });
+
+    return $receivedCount;
+}
 
     /**
      * @param  array<int, array<string, mixed>>  $items

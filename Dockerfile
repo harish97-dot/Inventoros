@@ -37,7 +37,7 @@ RUN set -eux; \
     apt-get install -y --no-install-recommends postgresql-client-17 mariadb-client sqlite3; \
     install-php-extensions \
         pdo_mysql pdo_pgsql pdo_sqlite \
-        bcmath exif gd intl pcntl zip opcache redis; \
+        bcmath exif gd intl pcntl zip opcache redis-5.3.7t; \
     apt-get purge -y --auto-remove gnupg; \
     rm -rf /var/lib/apt/lists/*; \
     command -v mysqldump; command -v pg_dump

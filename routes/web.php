@@ -6,6 +6,7 @@ use App\Support\PluginPageRoutes;
 use App\Http\Controllers\Webhooks\EasyPostWebhookController;
 use Illuminate\Foundation\Http\Middleware\ValidateCsrfToken;
 use Illuminate\Support\Facades\Route;
+use App\Http\Controllers\Peso\PesoShipmentController;
 
 /*
  * Web routes.
@@ -26,7 +27,15 @@ Route::prefix('install')->name('install.')->group(function () {
     Route::post('/admin', [InstallerController::class, 'createAdmin'])->name('admin.create');
     Route::get('/complete', [InstallerController::class, 'complete'])->name('complete');
 });
+Route::get('/peso/upload', [PesoShipmentController::class, 'create'])
+    ->name('peso.upload');
 
+Route::post('/peso/upload', [PesoShipmentController::class, 'store'])
+    ->name('peso.upload.store');
+
+Route::get('/peso/shipments/{id}', [PesoShipmentController::class, 'show'])
+    ->name('peso.shipments.show');
+    
 Route::get('/', function () {
     if (auth()->check()) {
         return redirect()->route('dashboard');

@@ -143,6 +143,12 @@ const sections = computed(() => [
             { icon: Contact, name: t('nav.customers'), href: route('customers.index'), active: ['customers.*'], perm: 'view_customers' },
             { icon: Undo2, name: t('nav.returns'), href: route('returns.index'), active: ['returns.*'], perm: 'manage_returns' },
             { icon: ClipboardList, name: t('nav.purchaseOrders'), href: route('purchase-orders.index'), active: ['purchase-orders.*'], perm: 'view_purchase_orders' },
+            {
+    icon: ClipboardList,
+    name: 'PESO / RE-12',
+    href: route('peso.upload'),
+    active: ['peso.*'],
+},
             { icon: Truck, name: t('nav.suppliers'), href: route('suppliers.index'), active: ['suppliers.*'], perm: 'view_suppliers' },
             { icon: BadgeCheck, name: t('nav.approvals'), href: route('approvals.index'), active: ['approvals.*'], perm: ['approve_purchase_orders', 'approve_stock_adjustments', 'approve_stock_transfers'], badge: pendingApprovalsCount.value },
         ],

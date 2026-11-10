@@ -1,0 +1,308 @@
+<?php
+
+namespace App\Services\Peso;
+
+use Smalot\PdfParser\Parser;
+
+class PesoPdfParser
+{
+    public function parse(string $pdfPath): array
+    {
+        $parser = new Parser();
+        $pdf = $parser->parseFile($pdfPath);
+        $text = $pdf->getText();
+
+        return [
+            're12_number'    => $this->extractRe12Number($text),
+            'peso_date'      => $this->extractPesoDate($text),
+            'licence_number' => $this->extractLicenceNumber($text),
+            'total_packages' => $this->extractTotalPackages($text),
+            'items'          => $this->extractItems($text),
+        ];
+    }
+
+    private function extractRe12Number(string $text): ?string
+    {
+        return preg_match(
+            '/Pass\s*No:\s*(RE-12\/\d{4}\/\d+)/i',
+            $text,
+            $m
+        ) ? trim($m[1]) : null;
+    }
+
+    private function extractPesoDate(string $text): ?string
+    {
+        if (!preg_match('/Date:\s*(\d{1,2}\/\d{1,2}\/\d{4})/i', $text, $m)) {
+            return null;
+        }
+
+        $date = \DateTime::createFromFormat('d/m/Y', $m[1]);
+        return $date ? $date->format('Y-m-d') : null;
+    }
+
+    private function extractLicenceNumber(string $text): ?string
+    {
+        if (preg_match(
+            '/E\/HQ\/TG\/\d+\/\d+\([A-Z0-9]+\)/i',
+            $text,
+            $m
+        )) {
+            return strtoupper(trim($m[0]));
+        }
+
+        return null;
+    }
+
+    private function extractTotalPackages(string $text): int
+    {
+        return preg_match(
+            '/This\s+pass\s+covers\s+(\d+)\s+packages/i',
+            $text,
+            $m
+        ) ? (int) $m[1] : 0;
+    }
+
+    /**
+     * Extract products by using "L1 Barcode" as the section anchor.
+     *
+     * The actual PDF text is not guaranteed to preserve table columns,
+     * so this method deliberately avoids depending on the quantity row.
+     */
+    private function extractItems(string $text): array
+    {
+        $text = str_replace(["\r\n", "\r"], "\n", $text);
+        $lines = preg_split('/\n+/', $text);
+
+        $cleanLines = [];
+
+        foreach ($lines as $line) {
+            $line = trim($line);
+
+            if ($line === '') {
+                continue;
+            }
+
+            $line = preg_replace('/[ \t]+/u', ' ', $line);
+            $cleanLines[] = trim($line);
+        }
+
+        $barcodeIndexes = [];
+
+        foreach ($cleanLines as $i => $line) {
+            if (preg_match('/^\s*L1\s+Barcode\s*$/i', $line)) {
+                $barcodeIndexes[] = $i;
+            }
+        }
+
+        $items = [];
+
+        foreach ($barcodeIndexes as $section => $barcodeIndex) {
+            $previousBarcodeIndex = $section > 0
+                ? $barcodeIndexes[$section - 1]
+                : -1;
+
+            $nextBarcodeIndex = $barcodeIndexes[$section + 1]
+                ?? count($cleanLines);
+
+            /*
+             * Product header lives between the previous barcode section
+             * and this L1 Barcode marker.
+             */
+            $headerStart = $previousBarcodeIndex + 1;
+            $headerEnd   = $barcodeIndex;
+
+            $header = array_slice(
+                $cleanLines,
+                $headerStart,
+                $headerEnd - $headerStart
+            );
+
+            /*
+             * Find the product number that belongs to this section.
+             * Search backwards from L1 Barcode, but never cross the
+             * previous L1 Barcode.
+             */
+            $productNumberIndex = null;
+
+            for ($i = count($header) - 1; $i >= 0; $i--) {
+                if (preg_match('/^\d+$/', $header[$i])) {
+                    $productNumberIndex = $i;
+                    break;
+                }
+            }
+
+            /*
+             * Some PDFs put the product number and product name on the
+             * same line. If that happened, split it here.
+             */
+            if ($productNumberIndex === null) {
+                continue;
+            }
+
+            $productInfo = array_slice(
+                $header,
+                $productNumberIndex + 1
+            );
+
+            $sizeCode = null;
+            $sizeIndex = null;
+
+            foreach ($productInfo as $i => $line) {
+                if (preg_match('/^[A-Z]{3}$/i', $line)) {
+                    $sizeCode = strtoupper($line);
+                    $sizeIndex = $i;
+                    break;
+                }
+            }
+
+            if ($sizeCode === null) {
+                continue;
+            }
+
+            /*
+             * Product name is everything before the size code,
+             * excluding classification/technical lines.
+             */
+            $nameParts = [];
+
+            for ($i = 0; $i < $sizeIndex; $i++) {
+                $line = trim($productInfo[$i]);
+
+                if ($line === '') {
+                    continue;
+                }
+
+                /*
+                 * Classification examples:
+                 * 90(Cl 2(0))(99)
+                 * 2(0)(100)
+                 * 6(2)
+                 */
+                if (stripos($line, 'Cl') !== false) {
+                    continue;
+                }
+
+                if (preg_match('/^[\d\s().\[\]\-]+$/', $line)) {
+                    continue;
+                }
+
+                /*
+                 * Ignore obvious table/header fragments.
+                 */
+                if (preg_match('/^(CAA|CDA|FAE)$/i', $line)) {
+                    continue;
+                }
+
+                $nameParts[] = $line;
+            }
+
+            $productName = $this->cleanProductName(
+                implode(' ', $nameParts)
+            );
+
+            if ($productName === '') {
+                continue;
+            }
+
+            /*
+             * Barcode block is everything after L1 Barcode until the
+             * next L1 Barcode. Stop at known document footer markers.
+             */
+            $barcodeLines = array_slice(
+                $cleanLines,
+                $barcodeIndex + 1,
+                $nextBarcodeIndex - $barcodeIndex - 1
+            );
+
+            $barcodeBlock = '';
+
+            foreach ($barcodeLines as $line) {
+                if (preg_match(
+                    '/^(Police Station|Signature|Consignee|Consignor|Authori[sz]ed)/i',
+                    $line
+                )) {
+                    break;
+                }
+
+                $barcodeBlock .= ' ' . $line;
+            }
+
+            $barcodes = $this->extractBarcodes(
+                $barcodeBlock,
+                $sizeCode
+            );
+
+            if (!$barcodes) {
+                continue;
+            }
+
+            $items[] = [
+                'product_name'       => $productName,
+                'size_code'          => $sizeCode,
+                'expected_l1_count'  => count($barcodes),
+                'barcodes'           => $barcodes,
+            ];
+        }
+
+        return $items;
+    }
+
+    private function cleanProductName(string $name): string
+    {
+        $name = trim($name);
+        $name = preg_replace('/\s+/u', ' ', $name);
+        $name = preg_replace('/\s*-\s*/', '-', $name);
+
+        return trim($name);
+    }
+
+    /**
+     * Extract 27-character manufacturer/L1 barcodes.
+     *
+     * A barcode starts with IN and is exactly 27 uppercase
+     * alphanumeric characters.
+     *
+     * The PDF may insert whitespace between barcode fragments,
+     * therefore whitespace is removed before extraction.
+     */
+    private function extractBarcodes(string $block, string $sizeCode): array
+    {
+        $clean = strtoupper(
+            preg_replace('/\s+/u', '', $block)
+        );
+
+        $barcodes = [];
+
+        /*
+         * Instead of splitting on every "IN", scan every character
+         * position. This is robust if the PDF parser concatenates
+         * barcode fragments.
+         */
+        $length = strlen($clean);
+
+        for ($i = 0; $i <= $length - 27; $i++) {
+            if (substr($clean, $i, 2) !== 'IN') {
+                continue;
+            }
+
+            $candidate = substr($clean, $i, 27);
+
+            if (!preg_match('/^[A-Z0-9]{27}$/', $candidate)) {
+                continue;
+            }
+
+            /*
+             * The size code is embedded in the actual barcode.
+             * This prevents accidental extraction of unrelated
+             * IN-prefixed document text.
+             */
+            if (strpos($candidate, strtoupper($sizeCode)) === false) {
+                continue;
+            }
+
+            $barcodes[$candidate] = true;
+        }
+
+        return array_keys($barcodes);
+    }
+}

@@ -127,9 +127,26 @@ services:
     volumes:
       - redis-data:/data
     restart: unless-stopped
-
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: inventoros
+      MYSQL_USER: inventoros
+      MYSQL_PASSWORD: inventoros
+      MYSQL_ROOT_PASSWORD: inventoros_root
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uinventoros", "-pinventoros"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
 volumes:
   app-data:
   app-storage:
   postgres-data:
   redis-data:
+  mysql-data:
