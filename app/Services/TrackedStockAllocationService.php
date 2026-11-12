@@ -50,14 +50,19 @@ final class TrackedStockAllocationService
      *
      * @api
      */
-    public function allocateForOrderItem(Product $product, int $quantity, OrderItem $orderItem, ?Collection $consumedHolds = null): int
-    {
-        if ($quantity <= 0) {
-            return 0;
-        }
+   public function allocateForOrderItem(Product $product, int $quantity, OrderItem $orderItem, ?Collection $consumedHolds = null): int
+{
+    if ($quantity <= 0) {
+        return 0;
+    }
 
-        $mine = ($consumedHolds ?? new Collection)->where('product_id', $product->id);
+    // PESO-managed products use the physical manufacturer barcode
+    // during loading/dispatch, not automatic serial allocation at order creation.
+    if ($product->peso_barcode_managed) {
+        return 0;
+    }
 
+    $mine = ($consumedHolds ?? new Collection)->where('product_id', $product->id);
         return match ($this->trackingType($product)) {
             TrackingType::SERIAL => $this->allocateSerials(
                 $product, $quantity, $orderItem,

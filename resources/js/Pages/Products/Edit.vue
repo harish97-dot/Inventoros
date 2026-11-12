@@ -98,6 +98,7 @@ const form = useForm({
     })),
     has_variants: props.product.has_variants || false,
     tracking_type: props.product.tracking_type || 'none',
+    peso_barcode_managed: !!props.product.peso_barcode_managed,
     type: props.product.type || 'standard',
     options: prepareExistingOptions(),
     variants: prepareExistingVariants(),
@@ -479,6 +480,34 @@ const fieldError = 'mt-1 text-xs text-status-danger';
                             <p v-if="form.errors.tracking_type" :class="fieldError">{{ form.errors.tracking_type }}</p>
                         </div>
                     </div>
+                    <!-- PESO Barcode Management -->
+<div class="lg:col-span-2">
+    <label class="flex items-start gap-3 cursor-pointer">
+        <input
+            id="peso_barcode_managed"
+            v-model="form.peso_barcode_managed"
+            type="checkbox"
+            class="mt-1 h-4 w-4 rounded border-border-default text-brand focus:ring-brand"
+        />
+
+        <span>
+            <span class="block text-sm font-medium text-text-primary">
+                PESO Manufacturer Barcode Managed
+            </span>
+
+            <span class="block mt-1 text-xs text-text-tertiary">
+                Use the actual manufacturer barcode from the PESO/RE-12
+                shipment during physical loading and dispatch instead of
+                automatically assigning a serial barcode when the customer
+                order is created.
+            </span>
+        </span>
+    </label>
+
+    <p v-if="form.errors.peso_barcode_managed" :class="fieldError">
+        {{ form.errors.peso_barcode_managed }}
+    </p>
+</div>
                 </Card>
 
                 <!-- Product Images (Full Width) -->

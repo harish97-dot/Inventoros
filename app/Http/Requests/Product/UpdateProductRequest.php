@@ -60,6 +60,7 @@ final class UpdateProductRequest extends FormRequest
             'images.*.name' => 'nullable|string',
             'has_variants' => 'boolean',
             'tracking_type' => 'nullable|string|in:none,batch,serial',
+            'peso_barcode_managed' => 'boolean',
             'options' => 'nullable|array|max:3',
             'options.*.id' => 'nullable|integer',
             'options.*.name' => 'required_with:options|string|max:255',

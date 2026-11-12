@@ -74,6 +74,7 @@ Route::get('/orders/{order}/edit', [OrderController::class, 'edit'])->name('orde
 Route::put('/orders/{order}', [OrderController::class, 'update'])->name('orders.update')->middleware('permission:edit_orders');
 Route::patch('/orders/{order}', [OrderController::class, 'update'])->middleware('permission:edit_orders');
 Route::get('/orders/{order}', [OrderController::class, 'show'])->name('orders.show')->middleware('permission:view_orders');
+Route::get('/orders/{order}/loading-barcodes', [OrderController::class, 'loadingBarcodes'])->name('orders.loading-barcodes') ->middleware('permission:view_orders');
 Route::delete('/orders/{order}', [OrderController::class, 'destroy'])->name('orders.destroy')->middleware('permission:delete_orders');
 Route::post('/orders/{order}/approve', [OrderController::class, 'approve'])->name('orders.approve')->middleware('permission:approve_orders');
 Route::post('/orders/{order}/reject', [OrderController::class, 'reject'])->name('orders.reject')->middleware('permission:approve_orders');

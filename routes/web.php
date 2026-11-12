@@ -7,6 +7,8 @@ use App\Http\Controllers\Webhooks\EasyPostWebhookController;
 use Illuminate\Foundation\Http\Middleware\ValidateCsrfToken;
 use Illuminate\Support\Facades\Route;
 use App\Http\Controllers\Peso\PesoShipmentController;
+use App\Http\Controllers\Receiving\ReceivingController;
+use App\Http\Controllers\Loading\LoadingController;
 
 /*
  * Web routes.
@@ -35,6 +37,30 @@ Route::post('/peso/upload', [PesoShipmentController::class, 'store'])
 
 Route::get('/peso/shipments/{id}', [PesoShipmentController::class, 'show'])
     ->name('peso.shipments.show');
+    Route::post(
+    '/peso/shipments/{id}/map-product',
+    [PesoShipmentController::class, 'mapProduct']
+)->name('peso.shipments.map-product');
+Route::post('/loading/scan', [LoadingController::class, 'scan'])
+    ->name('loading.scan');
+ 
+   // Authenticated application routes, split by module. Each file declares its
+// routes with Route:: and is required inside this group, inheriting `auth`.
+
+Route::middleware('auth')->group(function () {
+
+    Route::post('/receiving/scan', [ReceivingController::class, 'scan'])
+        ->name('receiving.scan');
+
+    require __DIR__.'/web/account.php';
+    require __DIR__.'/web/inventory.php';
+    require __DIR__.'/web/sales.php';
+    require __DIR__.'/web/admin.php';
+    require __DIR__.'/web/reports.php';
+    require __DIR__.'/web/approvals.php';
+    require __DIR__.'/web/cycle-counts.php';
+
+});
     
 Route::get('/', function () {
     if (auth()->check()) {
@@ -74,3 +100,10 @@ require __DIR__.'/auth.php';
 // Pages registered by active plugins with register_page(). Added last so a
 // plugin can never shadow a core route.
 PluginPageRoutes::register();
+
+Route::post('/peso/shipments/{id}/receive-all', [App\Http\Controllers\Peso\PesoShipmentController::class, 'receiveAll'])
+    ->name('peso.shipments.receive-all');
+Route::post('/peso/shipments/{id}/verify-barcode', [App\Http\Controllers\Peso\PesoShipmentController::class, 'verifyBarcode'])
+    ->name('peso.shipments.verify-barcode');
+
+Route::get('/peso/shipments/{id}/receive', [App\Http\Controllers\Peso\PesoShipmentController::class, 'receiveAll']);

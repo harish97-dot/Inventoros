@@ -33,6 +33,7 @@ class OrderResource extends JsonResource
             'source' => $this->source,
             'external_id' => $this->external_id,
             'customer_id' => $this->customer_id,
+            'warehouse_id' => $this->warehouse_id,
             'customer_name' => $this->customer_name,
             'customer_email' => $this->customer_email,
             'customer_address' => $this->customer_address,

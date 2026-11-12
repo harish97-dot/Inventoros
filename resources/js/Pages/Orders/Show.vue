@@ -13,7 +13,7 @@ import Badge from '@/Components/ui/Badge.vue';
 import SendDocumentModal from '@/Components/SendDocumentModal.vue';
 import ShipmentsPanel from '@/Components/Shipping/ShipmentsPanel.vue';
 import { Head, Link, useForm } from '@inertiajs/vue3';
-import { computed, ref, watch } from 'vue';
+import { computed, onMounted, ref, watch } from 'vue';
 import { usePermissions } from '@/composables/usePermissions';
 import { displayCalendarDate, displayDateTime, todayIsoDate } from '@/lib/dates';
 import { formatMoney } from '@/lib/money';
@@ -141,6 +141,143 @@ const submitApproval = () => {
 };
 
 const statusVariant = orderStatusVariant;
+const loadingBarcode = ref('');
+const loadingMessage = ref('');
+const loadingError = ref('');
+const loadingProcessing = ref(false);
+const loadedBarcodes = ref([]);
+
+/**
+ * Load manufacturer barcodes that were already assigned to this order.
+ *
+ * This is required because the barcode assignments are stored in the
+ * database and must be restored when the Order Show page is refreshed.
+ */
+const loadExistingBarcodes = async () => {
+    try {
+        const response = await fetch(
+            `/orders/${encodeURIComponent(props.order.id)}/loading-barcodes`,
+            {
+                method: 'GET',
+                headers: {
+                    Accept: 'application/json',
+                    'X-Requested-With': 'XMLHttpRequest',
+                },
+                credentials: 'same-origin',
+            }
+        );
+
+        const contentType = response.headers.get('content-type') || '';
+        const data = contentType.includes('application/json')
+            ? await response.json()
+            : null;
+
+        if (!response.ok || !data?.success) {
+            throw new Error(
+                data?.message || `Could not load assigned barcodes (HTTP ${response.status}).`
+            );
+        }
+
+        loadedBarcodes.value = (data.barcodes || []).map((item) => ({
+            barcode: item.barcode,
+            peso_item_id: item.peso_item_id,
+            order_item_id: item.order_item_id,
+            scanned_at: item.scanned_at
+                ? new Date(item.scanned_at).toLocaleTimeString()
+                : '',
+        }));
+
+        console.log(
+            'Existing loading barcodes loaded:',
+            loadedBarcodes.value
+        );
+    } catch (error) {
+        console.error(
+            'Failed to load existing loading barcodes:',
+            error
+        );
+
+        loadedBarcodes.value = [];
+    }
+};
+
+/**
+ * Load existing barcode assignments when the Order Show page mounts.
+ *
+ * Keep this as the ONLY onMounted call for loading barcodes.
+ */
+onMounted(() => {
+    loadExistingBarcodes();
+});
+
+/**
+ * Order items with the actual number of manufacturer barcodes
+ * already assigned to each order item.
+ */
+const loadingOrderItems = computed(() => {
+    const items = props.order.items || [];
+
+    return items.map((item) => {
+        const loadedCount = loadedBarcodes.value.filter(
+            (barcode) =>
+                Number(barcode.order_item_id) === Number(item.id)
+        ).length;
+
+        return {
+            ...item,
+            loaded_count: loadedCount,
+        };
+    });
+});
+
+const scanLoadingBarcode = async () => {
+    const barcode = loadingBarcode.value.trim();
+
+    if (!barcode || loadingProcessing.value) {
+        return;
+    }
+
+    loadingProcessing.value = true;
+    loadingMessage.value = '';
+    loadingError.value = '';
+
+    try {
+        const response = await fetch('/loading/scan', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-CSRF-TOKEN':
+                    document.querySelector('meta[name="csrf-token"]')?.getAttribute('content') || '',
+                'Accept': 'application/json',
+            },
+            body: JSON.stringify({
+                warehouse_id: props.order.warehouse_id,
+                order_item_id: props.order.items[0]?.id,
+                barcode,
+            }),
+        });
+
+        const data = await response.json();
+
+        if (!response.ok || !data.success) {
+            throw new Error(data.message || 'Barcode could not be assigned.');
+        }
+
+        loadedBarcodes.value.unshift({
+            barcode: data.barcode,
+            peso_item_id: data.peso_item_id,
+            order_item_id: data.order_item_id,
+            scanned_at: new Date().toLocaleTimeString(),
+        });
+
+        loadingMessage.value = `Barcode ${data.barcode} assigned successfully.`;
+        loadingBarcode.value = '';
+    } catch (error) {
+        loadingError.value = error.message || 'Barcode could not be assigned.';
+    } finally {
+        loadingProcessing.value = false;
+    }
+};
 
 const deleteOrder = () => {
     if (deleting.value) return;
@@ -310,7 +447,188 @@ const formatOrderDate = (date, long = false) =>
                             </div>
                         </div>
                     </Card>
+                    <!-- Loading / Manufacturer Barcode Scanning -->
+<Card
+    v-if="order.items && order.items.length > 0"
+    :padded="false"
+>
+    <div class="px-5 pt-5">
+        <h3 class="text-sm font-semibold text-text-primary">
+            Loading / Dispatch
+        </h3>
 
+        <p class="mt-1 text-xs text-text-tertiary">
+            Scan the actual manufacturer barcode when the physical box is loaded.
+        </p>
+    </div>
+
+    <div class="p-5">
+        <div class="rounded-lg border border-border-subtle bg-surface-canvas p-4">
+            <div class="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                    <p class="text-sm font-medium text-text-primary">
+                        {{ order.items[0].product_name }}
+                    </p>
+
+                    <p class="mt-1 text-xs text-text-secondary">
+                        Ordered quantity:
+                        <span class="font-semibold">{{ order.items[0].quantity }}</span>
+                    </p>
+
+                    <p class="mt-1 text-xs text-text-secondary">
+                        Loaded:
+                        <span class="font-semibold">{{ loadedBarcodes.length }}</span>
+                        /
+                        <span class="font-semibold">{{ order.items[0].quantity }}</span>
+                    </p>
+                </div>
+
+                <Badge
+                    :variant="loadedBarcodes.length >= Number(order.items[0].quantity) ? 'success' : 'warning'"
+                    size="sm"
+                    dot
+                >
+                    {{ loadedBarcodes.length >= Number(order.items[0].quantity) ? 'Complete' : 'Pending' }}
+                </Badge>
+            </div>
+
+            <div class="mt-4">
+                <label
+                    for="loading_barcode"
+                    class="mb-1 block text-sm font-medium text-text-secondary"
+                >
+                    Scan manufacturer barcode
+                </label>
+
+                <input
+                    id="loading_barcode"
+                    v-model="loadingBarcode"
+                    type="text"
+                    autocomplete="off"
+                    autofocus
+                    placeholder="Scan barcode..."
+                    class="h-11 w-full rounded-md border border-border-subtle bg-surface-canvas px-3 text-sm text-text-primary placeholder:text-text-tertiary ds-focus-ring"
+                    :disabled="loadingProcessing || loadedBarcodes.length >= Number(order.items[0].quantity)"
+                    @keyup.enter="scanLoadingBarcode"
+                />
+
+                <p class="mt-2 text-xs text-text-tertiary">
+                    Use the physical box barcode. Stock is not reduced again during loading.
+                </p>
+            </div>
+
+            <div
+                v-if="loadingMessage"
+                class="mt-3 rounded-md border border-status-success/20 bg-status-success-soft px-3 py-2 text-sm text-status-success"
+            >
+                {{ loadingMessage }}
+            </div>
+
+            <div
+                v-if="loadingError"
+                class="mt-3 rounded-md border border-status-danger/20 bg-status-danger-soft px-3 py-2 text-sm text-status-danger"
+            >
+                {{ loadingError }}
+            </div>
+        </div>
+
+        <div v-if="loadedBarcodes.length > 0" class="mt-4">
+            <p class="mb-2 text-xs font-medium text-text-secondary">
+                Loaded barcodes
+            </p>
+
+            <div class="divide-y divide-border-subtle rounded-lg border border-border-subtle">
+                <div
+                    v-for="item in loadedBarcodes"
+                    :key="item.peso_item_id"
+                    class="flex items-center justify-between gap-3 px-4 py-3"
+                >
+                    <div class="min-w-0">
+                        <p class="truncate font-mono text-xs text-text-primary">
+                            {{ item.barcode }}
+                        </p>
+
+                        <p class="mt-1 text-xs text-text-tertiary">
+                            Scanned {{ item.scanned_at }}
+                        </p>
+                    </div>
+
+                    <Badge variant="success" size="sm">
+                        Loaded
+                    </Badge>
+                </div>
+            </div>
+        </div>
+    </div>
+</Card>
+<!-- Approval Status -->
+<Card
+    v-if="approvalRequired && order.approval_status"
+    :padded="false"
+>
+    <div class="p-5">
+        <div class="flex flex-wrap items-start justify-between gap-4">
+            <div>
+                <h3 class="text-sm font-semibold text-text-primary">
+                    Approval Status
+                </h3>
+
+                <p class="mt-1 text-xs text-text-secondary">
+                    Order approval is the final dispatch step.
+                </p>
+            </div>
+
+            <Badge
+                :variant="approvalStatusVariant(order.approval_status)"
+                size="sm"
+                dot
+            >
+                {{ approvalText(order.approval_status) }}
+            </Badge>
+        </div>
+
+        <div
+            v-if="order.approval_status === 'pending'"
+            class="mt-4 rounded-lg border border-border-subtle bg-surface-canvas p-4"
+        >
+            <p class="text-sm text-text-secondary">
+                {{
+                    loadedBarcodes.length >= Number(order.items?.[0]?.quantity || 0)
+                        ? 'All required manufacturer barcodes have been loaded.'
+                        : `Load all required manufacturer barcodes before approving this order.`
+                }}
+            </p>
+
+            <div class="mt-3 flex items-center justify-between gap-3">
+                <div class="text-sm font-medium text-text-primary">
+                    Loaded:
+                    {{ loadedBarcodes.length }}
+                    /
+                    {{ order.items?.[0]?.quantity || 0 }}
+                </div>
+
+                <Button
+                    v-if="canApprove"
+                    variant="default"
+                    :disabled="
+                        processing ||
+                        loadedBarcodes.length !== Number(order.items?.[0]?.quantity || 0)
+                    "
+                    @click="openApprovalModal('approve')"
+                >
+                    Approve Order
+                </Button>
+            </div>
+
+            <p
+                v-if="loadedBarcodes.length !== Number(order.items?.[0]?.quantity || 0)"
+                class="mt-2 text-xs text-status-warning"
+            >
+                Approval is available only after all required barcodes are loaded.
+            </p>
+        </div>
+    </div>
+</Card>
                     <!-- Payments (only present for users with view_payments) -->
                     <Card v-if="order.payments !== undefined" :padded="false">
                         <div class="flex flex-wrap items-center justify-between gap-2 px-5 pt-5">
@@ -580,7 +898,7 @@ const formatOrderDate = (date, long = false) =>
                     </Card>
 
                     <!-- Approval Status -->
-                    <Card v-if="approvalRequired && order.approval_status" :padded="false">
+                   <Card v-if="order.approval_status" :padded="false">
                         <div class="px-5 pt-5"><h3 class="text-sm font-semibold text-text-primary">{{ t('orders.show.approvalStatus') }}</h3></div>
                         <div class="p-5">
                             <dl class="space-y-3">
@@ -799,66 +1117,100 @@ const formatOrderDate = (date, long = false) =>
             </div>
         </DialogSurface>
 
-        <!-- Approval Modal -->
-        <DialogSurface :show="!!(showApprovalModal)" @close="showApprovalModal = false">
-            <div v-if="showApprovalModal" class="fixed inset-0 z-50 flex items-center justify-center" @click="showApprovalModal = false">
-                <div class="fixed inset-0 bg-black/50"></div>
+<!-- Approval Modal -->
+<DialogSurface
+    :show="!!showApprovalModal"
+    @close="showApprovalModal = false"
+>
+    <div
+        v-if="showApprovalModal"
+        class="fixed inset-0 z-50 flex items-center justify-center"
+        @click="showApprovalModal = false"
+    >
+        <div class="fixed inset-0 bg-black/50"></div>
 
-                <div class="relative mx-4 w-full max-w-md rounded-xl border border-border-subtle bg-surface-raised p-6 shadow-lg" @click.stop>
-                    <div class="mb-4 flex items-center justify-between">
-                        <h3 class="text-base font-semibold text-text-primary">
-                            {{ approvalAction === 'approve' ? t('orders.show.approveOrder') : t('orders.show.rejectOrder') }}
-                        </h3>
-                        <button
-                            type="button"
-                            :aria-label="t('common.close')"
-                            @click="showApprovalModal = false"
-                            class="text-text-tertiary transition-colors hover:text-text-primary"
-                        >
-                            <X :size="18" />
-                        </button>
-                    </div>
+        <div
+            class="relative mx-4 w-full max-w-md rounded-xl border border-border-subtle bg-surface-raised p-6 shadow-lg"
+            @click.stop
+        >
+            <div class="mb-4 flex items-center justify-between">
+                <h3 class="text-base font-semibold text-text-primary">
+                    Approve Order
+                </h3>
 
-                    <div class="mb-6">
-                        <p class="mb-4 text-sm text-text-secondary">
-                            {{ approvalAction === 'approve'
-                                ? t('orders.show.confirmApprove', { number: order.order_number })
-                                : t('orders.show.confirmReject', { number: order.order_number })
-                            }}
-                        </p>
+                <button
+                    type="button"
+                    aria-label="Close"
+                    @click="showApprovalModal = false"
+                    class="text-text-tertiary transition-colors hover:text-text-primary"
+                >
+                    <X :size="18" />
+                </button>
+            </div>
 
-                        <div>
-                            <label :for="fieldIdPrefix + '-1'" class="mb-1 block text-sm font-medium text-text-secondary">
-                                {{ t('common.notes') }} {{ approvalAction === 'reject' ? t('orders.show.notesRequired') : t('orders.show.notesOptional') }}
-                            </label>
-                            <textarea :id="fieldIdPrefix + '-1'"
-                                v-model="approvalForm.notes"
-                                :aria-invalid="!!approvalForm.errors.notes"
-                                rows="3"
-                                class="w-full rounded-md border border-border-subtle bg-surface-canvas px-3 py-2 text-sm text-text-primary placeholder:text-text-tertiary ds-focus-ring"
-                                :placeholder="approvalAction === 'approve' ? t('orders.show.approvalNotesPlaceholder') : t('orders.show.rejectionNotesPlaceholder')"
-                                :required="approvalAction === 'reject'"
-                            ></textarea>
-                        </div>
-                    </div>
+            <div class="mb-6">
+                <p class="mb-4 text-sm text-text-secondary">
+                    Approve and dispatch order
+                    <strong>{{ order.order_number }}</strong>?
+                </p>
 
-                    <ActionError :errors="approvalForm.errors" />
-                    <div class="flex justify-end gap-3">
-                        <Button variant="secondary" @click="showApprovalModal = false" :disabled="processing">
-                            {{ t('common.cancel') }}
-                        </Button>
-                        <Button
-                            :variant="approvalAction === 'approve' ? 'default' : 'danger'"
-                            :loading="processing"
-                            :disabled="processing || (approvalAction === 'reject' && !approvalForm.notes.trim())"
-                            @click="submitApproval"
-                        >
-                            <span v-if="processing">{{ t('common.loading') }}</span>
-                            <span v-else>{{ approvalAction === 'approve' ? t('orders.show.approve') : t('orders.show.reject') }}</span>
-                        </Button>
-                    </div>
+                <div
+                    class="rounded-lg border border-status-success/20 bg-status-success-soft p-3 text-sm"
+                >
+                    <p class="font-medium text-status-success">
+                        Loaded: {{ loadedBarcodes.length }} /
+                        {{ order.items?.[0]?.quantity || 0 }}
+                    </p>
+
+                    <p class="mt-1 text-xs text-text-secondary">
+                        Stock will not be deducted again during approval.
+                    </p>
+                </div>
+
+                <div class="mt-4">
+                    <label
+                        :for="fieldIdPrefix + '-approval-notes'"
+                        class="mb-1 block text-sm font-medium text-text-secondary"
+                    >
+                        Approval notes
+                    </label>
+
+                    <textarea
+                        :id="fieldIdPrefix + '-approval-notes'"
+                        v-model="approvalForm.notes"
+                        rows="3"
+                        class="w-full rounded-md border border-border-subtle bg-surface-canvas px-3 py-2 text-sm text-text-primary placeholder:text-text-tertiary ds-focus-ring"
+                        placeholder="Optional approval notes..."
+                    ></textarea>
                 </div>
             </div>
-        </DialogSurface>
+
+            <ActionError :errors="approvalForm.errors" />
+
+            <div class="flex justify-end gap-3">
+                <Button
+                    variant="secondary"
+                    :disabled="processing"
+                    @click="showApprovalModal = false"
+                >
+                    Cancel
+                </Button>
+
+                <Button
+                    variant="default"
+                    :loading="processing"
+                    :disabled="
+                        processing ||
+                        loadedBarcodes.length !== Number(order.items?.[0]?.quantity || 0)
+                    "
+                    @click="submitApproval"
+                >
+                    <span v-if="processing">Approving...</span>
+                    <span v-else>Approve & Dispatch</span>
+                </Button>
+            </div>
+        </div>
+    </div>
+</DialogSurface>        
     </AppLayout>
 </template>

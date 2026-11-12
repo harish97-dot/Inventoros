@@ -6,6 +6,8 @@ namespace App\Models;
 
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use App\Models\Order\OrderItem;
+use App\Models\Inventory\Product;
 
 class PesoItem extends Model
 {
@@ -41,4 +43,8 @@ class PesoItem extends Model
     {
         return $this->belongsTo(Product::class);
     }
+    public function orderItem(): BelongsTo
+{
+    return $this->belongsTo(OrderItem::class);
+}
 }

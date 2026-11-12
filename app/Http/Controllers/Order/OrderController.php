@@ -20,6 +20,7 @@ use App\Models\Customer;
 use App\Models\Inventory\Product;
 use App\Models\Inventory\ProductVariant;
 use App\Models\Order\Order;
+use App\Models\PesoItem;
 use App\Models\Warehouse;
 use App\Services\OrderService;
 use App\Services\Shipping\OrderShippingPanel;
@@ -272,6 +273,44 @@ class OrderController extends Controller
                 'tabs' => get_page_components('orders.show', 'tabs'),
                 'footer' => get_page_components('orders.show', 'footer'),
             ],
+        ]);
+    }
+        /**
+     * Return manufacturer barcodes already assigned during loading.
+     */
+    public function loadingBarcodes(Request $request, Order $order): JsonResponse
+    {
+        if ($order->organization_id !== $request->user()->organization_id) {
+            abort(403, 'Unauthorized action.');
+        }
+
+        $barcodes = PesoItem::query()
+            ->where('organization_id', $request->user()->organization_id)
+            ->where('warehouse_id', $order->warehouse_id)
+            ->whereHas('orderItem', function ($query) use ($order) {
+                $query->where('order_id', $order->id);
+            })
+            ->whereNotNull('order_item_id')
+            ->orderByDesc('id')
+            ->get([
+                'id',
+                'barcode',
+                'order_item_id',
+                'status',
+                'updated_at',
+            ])
+            ->map(fn (PesoItem $item) => [
+                'peso_item_id' => $item->id,
+                'barcode' => $item->barcode,
+                'order_item_id' => $item->order_item_id,
+                'status' => $item->status,
+                'scanned_at' => $item->updated_at?->toIso8601String(),
+            ])
+            ->values();
+
+        return response()->json([
+            'success' => true,
+            'barcodes' => $barcodes,
         ]);
     }
 

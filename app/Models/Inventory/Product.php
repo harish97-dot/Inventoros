@@ -117,6 +117,7 @@ class Product extends Model
         'is_active',
         'has_variants',
         'tracking_type',
+        'peso_barcode_managed',
         'metadata',
     ];
 
@@ -157,6 +158,7 @@ class Product extends Model
             'price_in_currencies' => 'array',
             'images' => 'array',
             'image_disks' => 'array',
+            'peso_barcode_managed' => 'boolean',
         ];
     }
 

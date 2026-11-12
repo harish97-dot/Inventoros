@@ -27,6 +27,7 @@ use App\Support\ApprovalSettings;
 use App\Support\Money;
 use App\Support\OrderApprovalGate;
 use App\Support\SequenceNumberRetry;
+use App\Models\PesoItem;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\DB;
@@ -396,45 +397,84 @@ final class OrderService
         });
     }
 
-    /**
-     * Approve an order that is pending approval.
-     *
-     * Locks and re-reads the order so a concurrent approve/reject cannot both
-     * pass the pending check. Shared by the web and REST surfaces.
-     *
-     * @throws InvalidStateException When the order was already approved/rejected.
-     *
-     * @api
-     */
-    public function approve(Order $order, User $approver, ?string $notes = null): Order
-    {
-        OrderApprovalGate::assertMayApprove($order, $approver);
+/**
+ * Approve an order and complete dispatch.
+ *
+ * Approval is only allowed when every order item has the exact number
+ * of PESO barcodes loaded against it.
+ *
+ * Stock is NOT changed here because stock was already deducted when
+ * the order was created.
+ *
+ * @throws InvalidStateException When the order is not ready for dispatch.
+ */
+public function approve(Order $order, User $approver, ?string $notes = null): Order
+{
+    OrderApprovalGate::assertMayApprove($order, $approver);
 
-        $approved = DB::transaction(function () use ($order, $approver, $notes) {
-            $locked = Order::whereKey($order->getKey())->lockForUpdate()->firstOrFail();
+    $approved = DB::transaction(function () use ($order, $approver, $notes) {
+        $locked = Order::whereKey($order->getKey())
+            ->lockForUpdate()
+            ->firstOrFail();
 
-            if (! $locked->isPendingApproval()) {
-                throw new InvalidStateException('Order has already been processed.', 'already_processed');
+        if (! $locked->isPendingApproval()) {
+            throw new InvalidStateException(
+                'Order has already been processed.',
+                'already_processed'
+            );
+        }
+
+        /*
+         * Verify every order item has exactly the required number
+         * of loaded PESO barcodes.
+         */
+        $locked->load('items');
+
+        foreach ($locked->items as $orderItem) {
+            $loadedCount = PesoItem::query()
+                ->where('order_item_id', $orderItem->id)
+                ->count();
+
+            $requiredCount = (int) $orderItem->quantity;
+
+            if ($loadedCount !== $requiredCount) {
+                throw new InvalidStateException(
+                    "Cannot dispatch order {$locked->order_number}. "
+                    . "Product '{$orderItem->product_name}' requires "
+                    . "{$requiredCount} barcode(s), but only "
+                    . "{$loadedCount} barcode(s) have been loaded.",
+                    'barcode_loading_incomplete'
+                );
             }
+        }
 
-            $locked->update([
-                'approval_status' => 'approved',
-                'approved_by' => $approver->id,
-                'approved_at' => now(),
-                'approval_notes' => $notes,
-            ]);
+        /*
+         * Approval is the final dispatch step.
+         *
+         * IMPORTANT:
+         * Do not deduct stock here. Stock was already deducted
+         * when the order was created.
+         */
+        $now = now();
 
-            return $locked;
-        });
+        $locked->update([
+            'approval_status' => OrderApprovalStatus::APPROVED,
+            'approved_by' => $approver->id,
+            'approved_at' => $now,
+            'approval_notes' => $notes,
+            'status' => OrderStatus::SHIPPED,
+            'shipped_at' => $locked->shipped_at ?? $now,
+        ]);
 
-        // Load the approver relationship for notification
-        $approved->load('approver');
+        return $locked;
+    });
 
-        // Send notification to order creator
-        NotificationService::createOrderApprovalNotification($approved);
+    $approved->load('approver');
 
-        return $approved;
-    }
+    NotificationService::createOrderApprovalNotification($approved);
+
+    return $approved;
+}
 
     /**
      * Reject an order that is pending approval, cancelling it and restoring
