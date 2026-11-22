@@ -6,6 +6,8 @@ namespace App\Services\Peso;
 
 use App\Models\PesoItem;
 use App\Models\PesoShipment;
+use App\Models\PesoProductMapping;
+use App\Models\Inventory\Product;
 use App\Models\WarehouseLicence;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\ValidationException;
@@ -53,7 +55,11 @@ final class PesoShipmentImportService
         $barcodeCount = 0;
 
         foreach ($items as $item) {
-            $barcodeCount += count($item['barcodes'] ?? []);
+            $records = $item['barcode_records'] ?? array_map(
+                fn (string $barcode): array => ['barcode' => $barcode, 'level' => 'L1', 'parent_barcode' => null],
+                $item['barcodes'] ?? [],
+            );
+            $barcodeCount += count(array_filter($records, fn (array $record) => ($record['level'] ?? 'L1') === 'L1'));
         }
 
         $expectedPackages = (int) ($data['total_packages'] ?? 0);
@@ -98,18 +104,53 @@ final class PesoShipmentImportService
             foreach ($items as $item) {
                 $productName = trim((string) ($item['product_name'] ?? ''));
                 $sizeCode = trim((string) ($item['size_code'] ?? ''));
+                $mapping = PesoProductMapping::query()
+                    ->where('organization_id', $organizationId)
+                    ->where('manufacturer_name_key', PesoProductMapping::exactNameKey($productName))
+                    ->where('re12_code', $sizeCode)
+                    ->first();
+                $mappedProduct = $mapping?->product_id === null
+                    ? null
+                    : Product::query()
+                        ->where('organization_id', $organizationId)
+                        ->find($mapping->product_id);
+                // Partial products cannot enter stock with a default package quantity.
+                // Their product_id is attached only after staff confirms each physical quantity.
+                $productId = $mappedProduct !== null && ! $mappedProduct->partial_barcode_sales
+                    ? $mappedProduct->id
+                    : null;
+                $itemsByBarcode = [];
+                $records = $item['barcode_records'] ?? array_map(
+                    fn (string $barcode): array => ['barcode' => $barcode, 'level' => 'L1', 'parent_barcode' => null],
+                    $item['barcodes'] ?? [],
+                );
 
-                foreach ($item['barcodes'] as $barcode) {
-                    PesoItem::create([
+                foreach ($records as $record) {
+                    $barcode = trim((string) ($record['barcode'] ?? ''));
+                    if ($barcode === '') continue;
+                    $level = in_array($record['level'] ?? 'L1', ['L1', 'L2', 'L3'], true) ? $record['level'] : 'L1';
+                    $parentId = isset($record['parent_barcode']) ? ($itemsByBarcode[$record['parent_barcode']] ?? null) : null;
+                    $pesoItem = PesoItem::create([
                         'peso_shipment_id' => $shipment->id,
                         'organization_id' => $organizationId,
                         'warehouse_id' => $licence->warehouse_id,
-                        'product_id' => null,
+                        'product_id' => $level === 'L1' ? $productId : null,
+                        'product_variant_id' => $level === 'L1' ? $mapping?->product_variant_id : null,
+                        'peso_product_mapping_id' => $mapping?->id,
                         'product_name' => $productName,
                         'size_code' => $sizeCode !== '' ? $sizeCode : null,
-                        'barcode' => trim((string) $barcode),
+                        'barcode' => $barcode,
+                        'barcode_level' => $level,
+                        'parent_peso_item_id' => $parentId,
+                        // This is source-document metadata for the product group,
+                        // not a stock quantity. Preserve it on each barcode row;
+                        // only L1 rows are eligible to book inventory.
+                        'declared_quantity' => $item['declared_quantity'] ?? null,
+                        'declared_unit' => $item['declared_unit'] ?? null,
+                        'package_information' => $item['package_information'] ?? null,
                         'status' => 'expected',
                     ]);
+                    $itemsByBarcode[$barcode] = $pesoItem->id;
                 }
             }
 

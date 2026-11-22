@@ -305,8 +305,32 @@ class OrderController extends Controller
                 'order_item_id' => $item->order_item_id,
                 'status' => $item->status,
                 'scanned_at' => $item->updated_at?->toIso8601String(),
+                'allocated_quantity' => null,
+                'base_unit' => null,
             ])
             ->values();
+
+        $partialBarcodes = DB::table('peso_barcode_allocations as a')
+            ->join('order_items as oi', 'oi.id', '=', 'a.order_item_id')
+            ->join('peso_items as pi', 'pi.id', '=', 'a.peso_item_id')
+            ->where('oi.order_id', $order->id)
+            ->where('pi.organization_id', $request->user()->organization_id)
+            ->where('pi.warehouse_id', $order->warehouse_id)
+            ->selectRaw("pi.id as peso_item_id, pi.barcode, a.order_item_id, pi.status, MAX(a.occurred_at) as scanned_at, SUM(CASE WHEN a.event_type = 'allocated' THEN a.quantity ELSE -a.quantity END) as allocated_quantity, pi.base_unit")
+            ->groupBy('pi.id', 'pi.barcode', 'a.order_item_id', 'pi.status', 'pi.base_unit')
+            ->havingRaw("SUM(CASE WHEN a.event_type = 'allocated' THEN a.quantity ELSE -a.quantity END) > 0")
+            ->get()
+            ->map(fn ($row) => [
+                'peso_item_id' => (int) $row->peso_item_id,
+                'barcode' => $row->barcode,
+                'order_item_id' => (int) $row->order_item_id,
+                'status' => $row->status,
+                'scanned_at' => $row->scanned_at,
+                'allocated_quantity' => (int) $row->allocated_quantity,
+                'base_unit' => $row->base_unit,
+            ]);
+
+        $barcodes = $barcodes->concat($partialBarcodes)->values();
 
         return response()->json([
             'success' => true,
@@ -321,32 +345,94 @@ class OrderController extends Controller
      * @param  Order  $order  The order to edit
      */
     public function edit(Request $request, Order $order): Response
-    {
-        // Ensure user can only edit orders from their organization
-        if ($order->organization_id !== $request->user()->organization_id) {
-            abort(403, 'Unauthorized action.');
-        }
-
-        $organizationId = $request->user()->organization_id;
-
-        // Load each line's variant (so the form can show and round-trip it)
-        // and the linked customer (so the customer picker starts on it).
-        $order->load(['items.variant', 'customer']);
-
-        // Keep the variants the order already uses selectable even if they
-        // have since been deactivated, so editing the order doesn't force a
-        // switch away from them.
-        $products = $this->formProducts(
-            $organizationId,
-            $order->items->pluck('product_variant_id')->filter()->all(),
-        );
-
-        return Inertia::render('Orders/Edit', [
-            'order' => $order,
-            'products' => $products,
-            'awaitingApproval' => $order->isPendingApproval(),
-        ]);
+{
+    if ($order->organization_id !== $request->user()->organization_id) {
+        abort(403, 'Unauthorized action.');
     }
+
+    $organizationId = $request->user()->organization_id;
+
+    // Load each line's variant and the linked customer.
+    $order->load([
+        'items.variant',
+        'items.product',
+        'customer',
+    ]);
+
+    // Keep the variants the order already uses selectable even if they
+    // have since been deactivated.
+    $products = $this->formProducts(
+        $organizationId,
+        $order->items->pluck('product_variant_id')->filter()->all(),
+    );
+
+    /*
+     * Load PESO barcodes that are currently assigned to this order.
+     *
+     * These are used only by the Edit Order page so that an authorized
+     * user can explicitly choose which physical barcode(s) to release
+     * when reducing a PESO-managed order quantity.
+     */
+    $loadedPesoBarcodes = \App\Models\PesoItem::query()
+        ->where('organization_id', $organizationId)
+        ->where('warehouse_id', $order->warehouse_id)
+        ->whereIn('order_item_id', $order->items->pluck('id'))
+        ->whereNotNull('order_item_id')
+        ->orderBy('id')
+        ->get([
+            'id',
+            'order_item_id',
+            'barcode',
+            'status',
+            'updated_at',
+        ])
+        ->groupBy('order_item_id')
+        ->map(function ($items) {
+            return $items->map(function ($item) {
+                return [
+                    'peso_item_id' => $item->id,
+                    'barcode' => $item->barcode,
+                    'status' => $item->status,
+                    'scanned_at' => $item->updated_at?->toIso8601String(),
+                ];
+            })->values();
+        })
+        ->toArray();
+
+    $partialLoaded = DB::table('peso_barcode_allocations as a')
+        ->join('order_items as oi', 'oi.id', '=', 'a.order_item_id')
+        ->join('peso_items as pi', 'pi.id', '=', 'a.peso_item_id')
+        ->where('oi.order_id', $order->id)
+        ->where('pi.organization_id', $organizationId)
+        ->where('pi.warehouse_id', $order->warehouse_id)
+        ->selectRaw("pi.id as peso_item_id, pi.barcode, a.order_item_id, pi.status, MAX(a.occurred_at) as scanned_at, SUM(CASE WHEN a.event_type = 'allocated' THEN a.quantity ELSE -a.quantity END) as allocated_quantity, pi.base_unit")
+        ->groupBy('pi.id', 'pi.barcode', 'a.order_item_id', 'pi.status', 'pi.base_unit')
+        ->havingRaw("SUM(CASE WHEN a.event_type = 'allocated' THEN a.quantity ELSE -a.quantity END) > 0")
+        ->get()
+        ->groupBy('order_item_id')
+        ->map(fn ($items) => $items->map(fn ($item) => [
+            'peso_item_id' => (int) $item->peso_item_id,
+            'barcode' => $item->barcode,
+            'status' => $item->status,
+            'scanned_at' => $item->scanned_at,
+            'allocated_quantity' => (int) $item->allocated_quantity,
+            'base_unit' => $item->base_unit,
+        ])->values());
+
+    foreach ($partialLoaded as $orderItemId => $items) {
+        $loadedPesoBarcodes[$orderItemId] = collect($loadedPesoBarcodes[$orderItemId] ?? [])
+            ->concat($items)
+            ->values()
+            ->all();
+    }
+
+    return Inertia::render('Orders/Edit', [
+        'order' => $order,
+        'products' => $products,
+        'awaitingApproval' => $order->isPendingApproval(),
+        'loadedPesoBarcodes' => $loadedPesoBarcodes,
+    ]);
+}
 
     /**
      * Update the specified order.
@@ -355,88 +441,112 @@ class OrderController extends Controller
      * @param  Order  $order  The order to update
      * @return RedirectResponse
      */
-    public function update(UpdateOrderRequest $request, Order $order)
-    {
-        // Ensure user can only update orders from their organization
-        if ($order->organization_id !== $request->user()->organization_id) {
-            abort(403, 'Unauthorized action.');
-        }
+public function update(UpdateOrderRequest $request, Order $order)
+{
+    \Log::info('ORDER UPDATE RAW REQUEST', [
+    'items' => $request->input('items'),
+]);
 
-        $validated = $request->validated();
+$validated = $request->validated();
 
-        try {
-            DB::transaction(function () use ($validated, $order) {
-                // Lock and re-read the order inside the transaction so a
-                // double-submit or a concurrent ship/cancel can't be acted on
-                // against a stale, pre-transaction model (e.g. restock twice).
-                $order = Order::whereKey($order->getKey())->lockForUpdate()->firstOrFail();
+\Log::info('ORDER UPDATE DEBUG', [
+    'items' => $validated['items'] ?? null,
+]);
+    $actor = $request->user();
 
-                // A cancelled order's stock was already restored on cancel;
-                // reactivating it would oversell (a live order with its
-                // inventory handed back). Cancellation is terminal — create a
-                // new order instead.
-                if ($order->status === OrderStatus::CANCELLED
-                    && isset($validated['status'])
-                    && $validated['status'] !== OrderStatus::CANCELLED->value) {
-                    throw new InvalidStateException('A cancelled order cannot be reactivated. Create a new order instead.', 'invalid_state_transition');
-                }
+    try {
+        DB::transaction(function () use ($validated, $order, $actor) {
+            // Lock and re-read the order so concurrent edits cannot
+            // operate against stale state.
+            $lockedOrder = Order::query()
+                ->whereKey($order->getKey())
+                ->lockForUpdate()
+                ->firstOrFail();
 
-                $isCancelling = $validated['status'] === 'cancelled'
-                    && $order->status !== OrderStatus::CANCELLED;
+            // A cancelled order is terminal.
+            if (
+                $lockedOrder->status === OrderStatus::CANCELLED
+                && isset($validated['status'])
+                && $validated['status'] !== OrderStatus::CANCELLED->value
+            ) {
+                throw new InvalidStateException(
+                    'A cancelled order cannot be reactivated. Create a new order instead.',
+                    'invalid_state_transition'
+                );
+            }
 
-                if ($isCancelling) {
-                    // The same cancel REST and GraphQL use: refuses an order
-                    // whose goods have left or that has an open return, closes
-                    // its open shipments, and gives back only the stock the
-                    // order still holds. The line items stay as a record.
-                    // Refusals are RuntimeExceptions, flashed by the catch below.
-                    $order = $this->orderService->cancel($order);
-                } else {
-                    // Any other edit replaces the lines wholesale through the
-                    // audited fulfilment paths (bin consume + serial/batch
-                    // allocation + variant-aware ledger), so quantity changes and
-                    // added/removed lines cannot drift the per-location breakdown
-                    // or the tracked records the way a hand-rolled per-line adjust
-                    // did. InsufficientStock / InvalidOrderItem both extend
-                    // RuntimeException and are flashed by the catch below.
-                    $this->orderService->replaceItems(
-                        $order,
+            $isCancelling =
+                $validated['status'] === OrderStatus::CANCELLED->value
+                && $lockedOrder->status !== OrderStatus::CANCELLED;
+
+            if ($isCancelling) {
+                $this->orderService->cancel($lockedOrder);
+            } else {
+                $lockedOrder->load('items.product');
+                $usesBarcodeQuantities = $lockedOrder->items->contains(
+                    fn ($orderItem) => $orderItem->product?->partial_barcode_sales
+                        || $orderItem->product?->peso_barcode_managed
+                );
+
+                if ($usesBarcodeQuantities) {
+                    $this->orderService->updatePesoBarcodeOrderItems(
+                        $lockedOrder,
                         $validated['items'],
+                        $actor,
+                    );
+                } else {
+                    $this->orderService->replaceItems(
+                        $lockedOrder,
+                        $validated['items'],
+                        $actor,
                     );
                 }
+            }
 
-                // Recompute every total on the server from the stored lines
-                // (discounts, tax, shipping). A bad discount, or a total cut
-                // below what has already been paid, throws a
-                // ValidationException that rolls the edit back and returns
-                // the field errors to the form.
-                $this->orderService->recalculateTotals(
-                    $order,
-                    $validated['discount_type'] ?? null,
-                    $validated['discount_value'] ?? null,
-                    $validated['tax'] ?? 0,
-                    $validated['shipping'] ?? 0,
-                );
-                unset($validated['discount_type'], $validated['discount_value'], $validated['tax'], $validated['shipping']);
+            // Recalculate totals from the stored order lines.
+            $this->orderService->recalculateTotals(
+                $lockedOrder,
+                $validated['discount_type'] ?? null,
+                $validated['discount_value'] ?? null,
+                $validated['tax'] ?? 0,
+                $validated['shipping'] ?? 0,
+            );
 
-                // Update order timestamps based on status
-                if ($validated['status'] === 'shipped' && ! $order->shipped_at) {
-                    $validated['shipped_at'] = now();
-                } elseif ($validated['status'] === 'delivered' && ! $order->delivered_at) {
-                    $validated['delivered_at'] = now();
-                }
+            // These values are inputs to recalculateTotals(), not direct
+            // Order model fields for this update.
+            unset(
+                $validated['discount_type'],
+                $validated['discount_value'],
+                $validated['tax'],
+                $validated['shipping'],
+                $validated['items']
+            );
 
-                $order->update($validated);
-            });
-        } catch (BusinessRuleException $e) {
-            // Guard failures (e.g. cancelling a shipped order, insufficient
-            // stock on an item increase) flash an error rather than 500ing.
-            return redirect()->back()->with('error', $e->getMessage());
-        }
+            // Update timestamps based on status.
+            if (
+                $validated['status'] === OrderStatus::SHIPPED->value
+                && ! $lockedOrder->shipped_at
+            ) {
+                $validated['shipped_at'] = now();
+            } elseif (
+                $validated['status'] === OrderStatus::DELIVERED->value
+                && ! $lockedOrder->delivered_at
+            ) {
+                $validated['delivered_at'] = now();
+            }
 
-        return redirect()->route('orders.index')
-            ->with('success', __('Order updated successfully.'));
+            $lockedOrder->update($validated);
+        });
+    } catch (BusinessRuleException $e) {
+        return redirect()
+            ->back()
+            ->with('error', $e->getMessage());
     }
+
+    return redirect()
+        ->route('orders.index')
+        ->with('success', __('Order updated successfully.'));
+}
 
     /**
      * Remove the specified order.
@@ -581,7 +691,7 @@ class OrderController extends Controller
                 }
             })])
             ->orderBy('name')
-            ->get(['id', 'name', 'sku', 'price', 'currency', 'price_in_currencies', 'stock', 'has_variants', 'category_id', 'location_id'])
+            ->get(['id', 'name', 'sku', 'price', 'currency', 'price_in_currencies', 'stock', 'has_variants', 'category_id', 'location_id', 'base_inventory_unit', 'partial_barcode_sales', 'minimum_sale_quantity', 'sale_increment'])
             ->map(fn (Product $product) => [
                 'id' => $product->id,
                 'name' => $product->name,
@@ -593,6 +703,10 @@ class OrderController extends Controller
                 'prices' => (object) array_change_key_case(array_filter((array) ($product->price_in_currencies ?? []), 'is_numeric'), CASE_UPPER),
                 'stock' => (int) $product->stock,
                 'has_variants' => (bool) $product->has_variants,
+                'base_inventory_unit' => $product->base_inventory_unit,
+                'partial_barcode_sales' => (bool) $product->partial_barcode_sales,
+                'minimum_sale_quantity' => (int) $product->minimum_sale_quantity,
+                'sale_increment' => (int) $product->sale_increment,
                 'variants' => $product->has_variants
                     ? $product->variants->map(fn (ProductVariant $variant) => [
                         'id' => $variant->id,

@@ -6,6 +6,7 @@ namespace App\Http\Controllers\Loading;
 
 use App\Http\Controllers\Controller;
 use App\Services\Loading\LoadingService;
+use App\Models\PesoBarcodeAllocation;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Validation\ValidationException;
@@ -40,7 +41,14 @@ final class LoadingController extends Controller
                 'message' => 'Barcode assigned to order item.',
                 'barcode' => $pesoItem->barcode,
                 'peso_item_id' => $pesoItem->id,
-                'order_item_id' => $pesoItem->order_item_id,
+                'order_item_id' => (int) $validated['order_item_id'],
+                'allocated_quantity' => PesoBarcodeAllocation::query()
+                    ->where('peso_item_id', $pesoItem->id)
+                    ->where('order_item_id', (int) $validated['order_item_id'])
+                    ->where('event_type', 'allocated')
+                    ->latest('id')
+                    ->value('quantity'),
+                'base_unit' => $pesoItem->base_unit,
                 'warehouse_id' => $pesoItem->warehouse_id,
                 'product_id' => $pesoItem->product_id,
                 'status' => $pesoItem->status,

@@ -14,7 +14,9 @@ use App\Models\Purchasing\PurchaseOrder;
 use App\Models\Role;
 use App\Models\System\SystemSetting;
 use App\Models\User;
+use App\Models\Warehouse;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Foundation\Http\Middleware\PreventRequestForgery;
 use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Facades\Notification;
 use Tests\TestCase;
@@ -34,6 +36,10 @@ final class PurchaseOrderReceivingConcurrencyTest extends TestCase
     protected function setUp(): void
     {
         parent::setUp();
+        // These tests exercise the PO receiving route, not CSRF token handling.
+        // This disables the web CSRF middleware only inside this test class;
+        // production middleware remains enabled.
+        $this->withoutMiddleware(PreventRequestForgery::class);
 
         // Stock changes fan out to notifications that build a real mailer
         // otherwise; fake both so the receive flow never hits a transport.
@@ -62,8 +68,10 @@ final class PurchaseOrderReceivingConcurrencyTest extends TestCase
             'slug' => 'electronics',
         ]);
 
+        $warehouse = Warehouse::factory()->create(['organization_id' => $this->organization->id]);
         $location = ProductLocation::create([
             'organization_id' => $this->organization->id,
+            'warehouse_id' => $warehouse->id,
             'name' => 'Warehouse A',
             'code' => 'WH-A',
         ]);
@@ -128,6 +136,7 @@ final class PurchaseOrderReceivingConcurrencyTest extends TestCase
 
         $item = $po->items()->create([
             'product_id' => $this->product->id,
+            'receiving_location_id' => $this->product->location_id,
             'product_name' => $this->product->name,
             'sku' => $this->product->sku,
             'quantity_ordered' => 10,
@@ -138,11 +147,15 @@ final class PurchaseOrderReceivingConcurrencyTest extends TestCase
             'total' => 50.00,
         ]);
 
-        $payload = ['items' => [['id' => $item->id, 'quantity_to_receive' => 10]]];
+        $payload = ['items' => [[
+            'id' => $item->id,
+            'quantity_to_receive' => 10,
+            'barcodes' => array_map(fn (int $index): string => "PO-RECV-001-{$index}", range(1, 10)),
+        ]]];
 
-        $this->actingAs($this->admin)
-            ->post(route('purchase-orders.process-receiving', $po), $payload)
-            ->assertRedirect();
+        $response = $this->actingAs($this->admin)
+            ->post(route('purchase-orders.process-receiving', $po), $payload);
+        $response->assertRedirect(route('purchase-orders.show', $po));
 
         $this->assertSame(10, $this->product->fresh()->stock);
 
@@ -167,14 +180,19 @@ final class PurchaseOrderReceivingConcurrencyTest extends TestCase
             'subtotal' => 50.00, 'tax' => 0, 'total' => 50.00, 'currency' => 'USD',
         ]);
         $item = $po->items()->create([
-            'product_id' => $this->product->id, 'product_name' => $this->product->name, 'sku' => $this->product->sku,
+            'product_id' => $this->product->id, 'receiving_location_id' => $this->product->location_id,
+            'product_name' => $this->product->name, 'sku' => $this->product->sku,
             'quantity_ordered' => 10, 'quantity_received' => 0,
             'unit_cost' => 5.00, 'subtotal' => 50.00, 'tax' => 0, 'total' => 50.00,
         ]);
 
         $this->actingAs($this->admin)
-            ->post(route('purchase-orders.process-receiving', $po), ['items' => [['id' => $item->id, 'quantity_to_receive' => 10]]])
-            ->assertRedirect();
+            ->post(route('purchase-orders.process-receiving', $po), ['items' => [[
+                'id' => $item->id,
+                'quantity_to_receive' => 10,
+                'barcodes' => array_map(fn (int $index): string => "PO-RECV-BIN-{$index}", range(1, 10)),
+            ]]])
+            ->assertRedirect(route('purchase-orders.show', $po));
 
         // The received units land in the product's location bin, in step with
         // the total (both 10), rather than drifting into "unassigned".

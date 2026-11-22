@@ -28,6 +28,8 @@ use App\Support\Money;
 use App\Support\OrderApprovalGate;
 use App\Support\SequenceNumberRetry;
 use App\Models\PesoItem;
+use App\Models\Peso\PesoBarcodeRelease;
+use App\Models\PesoBarcodeAllocation;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\DB;
@@ -55,6 +57,8 @@ use Illuminate\Validation\ValidationException;
  * The caller resolves the warehouse (session/default fallback lives in the web
  * layer) and passes the acting User explicitly — the service never reaches for
  * auth(), so it behaves identically under web, API, queue, and console.
+ *
+ * The caller resolves the warehouse...
  */
 final class OrderService
 {
@@ -183,6 +187,8 @@ final class OrderService
 
                 $lines[] = compact('item', 'product', 'variant', 'target', 'key', 'index')
                     + ['qty' => (int) $item['quantity']];
+
+                $this->assertProductSaleQuantity($product, (int) $item['quantity']);
             }
 
             // An order fulfilling a reservation consumes its holds first, so
@@ -407,6 +413,8 @@ final class OrderService
  * the order was created.
  *
  * @throws InvalidStateException When the order is not ready for dispatch.
+ *
+ * @api
  */
 public function approve(Order $order, User $approver, ?string $notes = null): Order
 {
@@ -428,9 +436,30 @@ public function approve(Order $order, User $approver, ?string $notes = null): Or
          * Verify every order item has exactly the required number
          * of loaded PESO barcodes.
          */
-        $locked->load('items');
+        $locked->load('items.product');
 
         foreach ($locked->items as $orderItem) {
+            if (! $orderItem->product?->peso_barcode_managed && ! $orderItem->product?->partial_barcode_sales) {
+                continue;
+            }
+
+            if ($orderItem->product?->partial_barcode_sales) {
+                $allocated = (int) PesoBarcodeAllocation::query()
+                    ->where('order_item_id', $orderItem->id)
+                    ->selectRaw("COALESCE(SUM(CASE WHEN event_type = 'allocated' THEN quantity ELSE -quantity END), 0) as quantity")
+                    ->value('quantity');
+
+                if ($allocated !== (int) $orderItem->quantity) {
+                    throw new InvalidStateException(
+                        "Cannot dispatch order {$locked->order_number}. Product '{$orderItem->product_name}' requires "
+                        . "{$orderItem->quantity} {$orderItem->product->base_inventory_unit} allocated, but only {$allocated} is loaded.",
+                        'barcode_loading_incomplete'
+                    );
+                }
+
+                continue;
+            }
+
             $loadedCount = PesoItem::query()
                 ->where('order_item_id', $orderItem->id)
                 ->count();
@@ -750,6 +779,14 @@ public function approve(Order $order, User $approver, ?string $notes = null): Or
         $restockable = $this->restockableQuantities($locked);
 
         foreach ($locked->items as $item) {
+            if ($item->product?->partial_barcode_sales) {
+                $this->releasePartialBarcodeAllocations(
+                    $item,
+                    PHP_INT_MAX,
+                    $reason,
+                );
+            }
+
             $this->restockItem($item, $reason, $locked, $restockable[$item->id] ?? 0, $actor);
         }
     }
@@ -915,6 +952,7 @@ public function approve(Order $order, User $approver, ?string $notes = null): Or
             }
 
             $qty = (int) $item['quantity'];
+            $this->assertProductSaleQuantity($product, $qty);
             $available[$key] ??= (int) $target->stock - $reservations->reservedTotal((int) $product->id, $variant?->id);
             $running[$key] = ($running[$key] ?? $available[$key]) - $qty;
             if ($commitsStock && $running[$key] < 0) {
@@ -1471,5 +1509,398 @@ public function approve(Order $order, User $approver, ?string $notes = null): Or
         }
 
         return $line['product']->name;
+    }
+
+    /**
+     * Safely update order quantities for PESO barcode-managed order items.
+     *
+     * Loaded barcodes remain attached to their order item. When quantity is
+     * reduced, the exact loaded barcode IDs to release must be supplied as
+     * `release_barcode_ids` on that order item.
+     *
+     * Stock is not changed here. Order creation already committed the stock.
+     * Increasing quantity requires additional physical barcode scans through
+     * the loading flow before approval.
+     */
+    public function updatePesoBarcodeOrderItems(
+        Order $order,
+        array $items,
+        User $actor,
+        array $barcodeReleases = []
+    ): string {
+        return DB::transaction(function () use ($order, $items, $actor, $barcodeReleases): string {
+            $lockedOrder = Order::query()
+                ->whereKey($order->getKey())
+                ->lockForUpdate()
+                ->firstOrFail();
+
+            if ($lockedOrder->approval_status === OrderApprovalStatus::APPROVED) {
+                throw new InvalidOrderItemException('An approved order cannot be edited.');
+            }
+
+            if ($lockedOrder->status === OrderStatus::CANCELLED) {
+                throw new InvalidOrderItemException('A cancelled order cannot be edited.');
+            }
+
+            $lockedOrder->load('items.product', 'items.variant');
+
+            $submitted = collect($items)->keyBy(
+                fn (array $item) => (int) ($item['id'] ?? 0)
+            );
+
+            foreach ($lockedOrder->items as $orderItem) {
+                $item = $submitted->get((int) $orderItem->id);
+
+                if ($item === null) {
+                    throw new InvalidOrderItemException(
+                        "Order item {$orderItem->id} cannot be removed directly. "
+                        . 'Adjust its quantity and release loaded PESO barcodes explicitly instead.'
+                    );
+                }
+
+                $oldQuantity = (int) $orderItem->quantity;
+                $newQuantity = (int) ($item['quantity'] ?? 0);
+                $product = $orderItem->product;
+
+                if ($newQuantity < 1) {
+                    throw new InvalidOrderItemException('Order item quantity must be at least 1.');
+                }
+
+                if ($product !== null) {
+                    $this->assertProductSaleQuantity($product, $newQuantity);
+                }
+
+                if (
+                    (int) $item['product_id'] !== (int) $orderItem->product_id
+                    || (int) ($item['product_variant_id'] ?? 0) !== (int) ($orderItem->product_variant_id ?? 0)
+                ) {
+                    $hasLoaded = PesoItem::query()
+                        ->where('order_item_id', $orderItem->id)
+                        ->exists()
+                        || PesoBarcodeAllocation::query()->where('order_item_id', $orderItem->id)->exists();
+
+                    if ($hasLoaded) {
+                        throw new InvalidOrderItemException(
+                            "Product cannot be changed for order item {$orderItem->id} while PESO barcodes are loaded."
+                        );
+                    }
+                }
+
+                $loaded = PesoItem::query()
+                    ->where('order_item_id', $orderItem->id)
+                    ->lockForUpdate()
+                    ->get();
+
+                $loadedCount = $loaded->count();
+
+                $releaseIds = collect($item['release_barcode_ids'] ?? [])
+                    ->map(fn ($id) => (int) $id)
+                    ->filter(fn (int $id) => $id > 0)
+                    ->unique()
+                    ->values();
+
+                // Ordinary products keep their regular stock-ledger behavior
+                // even when another line on the same order uses PESO loading.
+                if (! $product?->partial_barcode_sales && ! $product?->peso_barcode_managed) {
+                    if ($releaseIds->isNotEmpty()) {
+                        throw new InvalidOrderItemException('Barcode releases are only available for PESO-managed order items.');
+                    }
+
+                    $this->adjustCommittedOrderItemQuantity($orderItem, $newQuantity - $oldQuantity, $lockedOrder, $actor);
+                    $this->updateOrderItemPricing($orderItem, $item, $newQuantity);
+                    continue;
+                }
+
+                if ($product?->partial_barcode_sales) {
+                    if ($releaseIds->isNotEmpty()) {
+                        throw new InvalidOrderItemException('Partial barcode quantities are released automatically when the line quantity changes.');
+                    }
+
+                    $activeAllocated = (int) PesoBarcodeAllocation::query()
+                        ->where('order_item_id', $orderItem->id)
+                        ->selectRaw("COALESCE(SUM(CASE WHEN event_type = 'allocated' THEN quantity ELSE -quantity END), 0) as quantity")
+                        ->value('quantity');
+
+                    if ($newQuantity < $oldQuantity) {
+                        $delta = $oldQuantity - $newQuantity;
+                        $this->releasePartialBarcodeAllocations(
+                            $orderItem,
+                            min($delta, $activeAllocated),
+                            'Order quantity reduced',
+                            $actor,
+                            $oldQuantity,
+                            $newQuantity,
+                        );
+                    }
+
+                    $this->adjustCommittedOrderItemQuantity($orderItem, $newQuantity - $oldQuantity, $lockedOrder, $actor);
+
+                    $this->updateOrderItemPricing($orderItem, $item, $newQuantity);
+                    continue;
+                }
+
+                if ($newQuantity < $oldQuantity) {
+                    $requiredReleaseCount = max(0, $loadedCount - $newQuantity);
+
+                    if ($releaseIds->count() !== $requiredReleaseCount) {
+                        throw new InvalidOrderItemException(
+                            "Product '{$orderItem->product_name}' requires exactly "
+                            . "{$requiredReleaseCount} barcode(s) to be released when changing "
+                            . "quantity from {$oldQuantity} to {$newQuantity}."
+                        );
+                    }
+
+                    if ($releaseIds->isNotEmpty()) {
+                        $releaseItems = $loaded
+                            ->filter(fn (PesoItem $pesoItem) => $releaseIds->contains($pesoItem->id))
+                            ->values();
+
+                        if ($releaseItems->count() !== $releaseIds->count()) {
+                            throw new InvalidOrderItemException(
+                                'One or more selected barcodes do not belong to this order item.'
+                            );
+                        }
+
+                        foreach ($releaseItems as $pesoItem) {
+                            if ($pesoItem->status !== 'received') {
+                                throw new InvalidOrderItemException(
+                                    "Barcode {$pesoItem->barcode} cannot be released because its current status is {$pesoItem->status}."
+                                );
+                            }
+
+                            $pesoItem->order_item_id = null;
+                            $pesoItem->save();
+
+                            PesoBarcodeRelease::create([
+                                'peso_item_id' => $pesoItem->id,
+                                'order_id' => $lockedOrder->id,
+                                'order_item_id' => $orderItem->id,
+                                'barcode' => $pesoItem->barcode,
+                                'old_quantity' => $oldQuantity,
+                                'new_quantity' => $newQuantity,
+                                'released_by' => $actor->id,
+                                'released_at' => now(),
+                                'reason' => 'Order quantity reduced',
+                            ]);
+                        }
+                    }
+                } elseif ($releaseIds->isNotEmpty()) {
+                    throw new InvalidOrderItemException(
+                        'Barcode releases can only be supplied when reducing quantity.'
+                    );
+                }
+
+                $remainingLoadedCount = PesoItem::query()
+                    ->where('order_item_id', $orderItem->id)
+                    ->count();
+
+                if ($remainingLoadedCount > $newQuantity) {
+                    throw new InvalidOrderItemException(
+                        "Quantity {$newQuantity} is less than the {$remainingLoadedCount} barcode(s) still assigned."
+                    );
+                }
+
+                $this->adjustCommittedOrderItemQuantity($orderItem, $newQuantity - $oldQuantity, $lockedOrder, $actor);
+
+                $orderItem->quantity = $newQuantity;
+
+                if (array_key_exists('unit_price', $item)) {
+                    $orderItem->unit_price = $item['unit_price'];
+                }
+
+                if (array_key_exists('discount_type', $item)) {
+                    $orderItem->discount_type = $item['discount_type'] ?: null;
+                }
+
+                if (array_key_exists('discount_value', $item)) {
+                    $orderItem->discount_value = $item['discount_value'];
+                }
+
+                $orderItem->subtotal = Money::multiply(
+                    $orderItem->unit_price,
+                    $newQuantity
+                );
+
+                $orderItem->save();
+            }
+
+            return 'updated';
+        });
+    }
+
+    private function assertProductSaleQuantity(Product $product, int $quantity): void
+    {
+        if ($product->acceptsSaleQuantity($quantity)) {
+            return;
+        }
+
+        throw new InvalidOrderItemException(
+            "{$product->name} must be sold in quantities of at least {$product->minimum_sale_quantity} "
+            . "{$product->base_inventory_unit}, in increments of {$product->sale_increment}."
+        );
+    }
+
+    private function updateOrderItemPricing(OrderItem $orderItem, array $item, int $quantity): void
+    {
+        if (array_key_exists('unit_price', $item)) {
+            $orderItem->unit_price = $item['unit_price'];
+        }
+        if (array_key_exists('discount_type', $item)) {
+            $orderItem->discount_type = $item['discount_type'] ?: null;
+        }
+        if (array_key_exists('discount_value', $item)) {
+            $orderItem->discount_value = $item['discount_value'];
+        }
+
+        $priced = $this->priceLine($orderItem->unit_price, $quantity, [
+            'discount_type' => $orderItem->discount_type?->value ?? $orderItem->discount_type,
+            'discount_value' => $orderItem->discount_value,
+            'tax' => $orderItem->tax,
+        ], 0);
+        $orderItem->quantity = $quantity;
+        $orderItem->subtotal = $priced['subtotal'];
+        $orderItem->discount_amount = $priced['discount_amount'];
+        $orderItem->tax = $priced['tax'];
+        $orderItem->total = $priced['total'];
+        $orderItem->save();
+    }
+
+    /** Apply an order-line quantity delta to the same product/variant stock target. */
+    private function adjustCommittedOrderItemQuantity(OrderItem $item, int $delta, Order $order, ?User $actor): void
+    {
+        if ($delta === 0 || ! $order->stock_committed) {
+            return;
+        }
+
+        if ($delta < 0) {
+            $this->restockItem($item, "Order {$order->order_number} quantity reduced", $order, abs($delta), $actor);
+
+            return;
+        }
+
+        $product = $item->product;
+        if ($product === null) {
+            throw new InvalidOrderItemException('The product for this order item no longer exists.');
+        }
+
+        Product::withTrashed()->whereKey($product->id)->lockForUpdate()->first();
+        $variant = $item->variant;
+        if ($variant !== null) {
+            $variant = ProductVariant::withTrashed()->whereKey($variant->id)->lockForUpdate()->first();
+        }
+
+        $target = $variant ?? $product;
+        $available = (int) $target->stock
+            - app(StockReservationService::class)->reservedTotal((int) $product->id, $variant?->id);
+        if ($available < $delta) {
+            throw new InsufficientStockException(
+                "Insufficient stock for {$product->name}. Available: ".max(0, $available).", requested: {$delta}"
+            );
+        }
+
+        if ($variant !== null) {
+            StockAdjustment::adjustVariant(
+                $variant,
+                -$delta,
+                'order_fulfillment',
+                "Order {$order->order_number} quantity increased",
+                null,
+                $order,
+                allowNegative: false,
+                actor: $this->restockActor($order, $actor),
+                preferWarehouseId: $this->fulfillingWarehouseId($order),
+            );
+        } else {
+            app(ProductLocationStockService::class)->consume($product, $delta, $this->fulfillingWarehouseId($order));
+            StockAdjustment::adjust(
+                $product,
+                -$delta,
+                'order_fulfillment',
+                "Order {$order->order_number} quantity increased",
+                null,
+                $order,
+                allowNegative: false,
+                actor: $this->restockActor($order, $actor),
+                syncBins: false,
+            );
+            app(TrackedStockAllocationService::class)->allocateForOrderItem($product, $delta, $item);
+        }
+    }
+
+    /** Record a release event and restore the quantity to the same PESO barcode. */
+    private function releasePartialBarcodeAllocations(
+        OrderItem $orderItem,
+        int $quantity,
+        string $reason,
+        User $actor,
+        int $oldOrderQuantity,
+        int $newOrderQuantity,
+    ): void
+    {
+        if ($quantity <= 0) {
+            return;
+        }
+
+        $events = PesoBarcodeAllocation::query()
+            ->where('order_item_id', $orderItem->id)
+            ->orderByDesc('id')
+            ->lockForUpdate()
+            ->get();
+
+        $activeByBarcode = [];
+        foreach ($events as $event) {
+            $id = (int) $event->peso_item_id;
+            $activeByBarcode[$id] ??= 0;
+            $activeByBarcode[$id] += $event->event_type === 'allocated'
+                ? (int) $event->quantity
+                : -(int) $event->quantity;
+        }
+
+        $left = $quantity;
+        foreach ($activeByBarcode as $pesoItemId => $active) {
+            if ($left <= 0) {
+                break;
+            }
+
+            $release = min($left, max(0, $active));
+            if ($release === 0) {
+                continue;
+            }
+
+            $pesoItem = PesoItem::query()->whereKey($pesoItemId)->lockForUpdate()->first();
+            if ($pesoItem === null) {
+                continue;
+            }
+
+            $newRemaining = (int) $pesoItem->remaining_quantity + $release;
+            if ($newRemaining > (int) $pesoItem->original_quantity) {
+                throw new InvalidOrderItemException("Barcode {$pesoItem->barcode} would exceed its original quantity when released.");
+            }
+            $pesoItem->remaining_quantity = $newRemaining;
+            $pesoItem->save();
+
+            PesoBarcodeAllocation::create([
+                'peso_item_id' => $pesoItem->id,
+                'order_item_id' => $orderItem->id,
+                'event_type' => 'released',
+                'quantity' => $release,
+                'occurred_at' => now(),
+                'reason' => $reason,
+            ]);
+
+            PesoBarcodeRelease::create([
+                'peso_item_id' => $pesoItem->id,
+                'order_id' => $orderItem->order_id,
+                'order_item_id' => $orderItem->id,
+                'barcode' => $pesoItem->barcode,
+                'old_quantity' => $oldOrderQuantity,
+                'new_quantity' => $newOrderQuantity,
+                'released_by' => $actor->id,
+                'released_at' => now(),
+                'reason' => $reason,
+            ]);
+
+            $left -= $release;
+        }
     }
 }

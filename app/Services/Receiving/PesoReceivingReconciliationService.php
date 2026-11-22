@@ -10,6 +10,10 @@ use Illuminate\Support\Facades\DB;
 
 final class PesoReceivingReconciliationService
 {
+    public function __construct(
+        private readonly PesoStockReceiptService $stockReceiptService,
+    ) {}
+
     /**
      * Reconcile physically scanned barcodes against one PESO shipment.
      */
@@ -78,6 +82,8 @@ final class PesoReceivingReconciliationService
                         'status' => 'received',
                         'received_at' => $scan->scanned_at ?? now(),
                     ]);
+
+                    $this->stockReceiptService->receive($pesoItem, $scan->scanned_by);
 
                     $verified++;
                 }

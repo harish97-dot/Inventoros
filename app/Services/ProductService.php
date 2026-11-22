@@ -49,6 +49,8 @@ final class ProductService
      */
     public function create(array $data): Product
     {
+        $data = $this->normaliseQuantityRules($data, true);
+        $data['base_inventory_unit'] = $data['base_inventory_unit'] ?? 'unit';
         $data = $this->normaliseCurrencies($data);
         $data = $this->processStoreImages($data);
 
@@ -97,6 +99,7 @@ final class ProductService
      */
     public function update(Product $product, array $data): Product
     {
+        $data = $this->normaliseQuantityRules($data);
         $oldImages = $product->images ?? [];
         $oldDisks = $product->image_disks ?? [];
         unset($data['image_disks']);
@@ -177,6 +180,35 @@ final class ProductService
         }
 
         return $product;
+    }
+
+    /** Convert the JSON text fields used by the product form to their array casts. */
+    private function normaliseQuantityRules(array $data, bool $creating = false): array
+    {
+        if ($creating && ! array_key_exists('base_inventory_unit', $data)) {
+            $data['base_inventory_unit'] = 'unit';
+        }
+
+        foreach (['billing_conversion', 'packaging_conversions'] as $field) {
+            if (isset($data[$field]) && is_string($data[$field])) {
+                $data[$field] = json_decode($data[$field], true, 512, JSON_THROW_ON_ERROR);
+            }
+        }
+
+        foreach (['partial_barcode_sales', 'minimum_sale_quantity', 'sale_increment'] as $field) {
+            if (array_key_exists($field, $data)) {
+                $data[$field] = $field === 'partial_barcode_sales'
+                    ? (bool) $data[$field]
+                    : (int) $data[$field];
+            } elseif ($creating) {
+                $data[$field] = match ($field) {
+                    'partial_barcode_sales' => false,
+                    default => 1,
+                };
+            }
+        }
+
+        return $data;
     }
 
     /**

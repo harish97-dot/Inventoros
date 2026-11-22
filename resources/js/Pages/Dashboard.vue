@@ -55,12 +55,49 @@ const props = defineProps({
     reorderSuggestions: { type: Array, default: () => [] },
     recentOrders: { type: Array, default: () => [] },
     stockByCategory: { type: Array, default: () => [] },
+    catalogProducts: { type: Array, default: () => [] },
     widgetPreferences: { type: Object, default: () => ({}) },
     pluginComponents: { type: Object, default: () => ({}) },
     pluginWidgets: { type: Array, default: () => [] },
     can: { type: Object, default: () => ({}) },
     systemWarnings: { type: Array, default: () => [] },
 });
+// Catalog data is an optional additive dashboard payload. Normalize it before
+// rendering so older servers, partial Inertia responses, or null nested rows
+// cannot prevent the existing dashboard from mounting.
+const catalogInventory = computed(() => {
+    if (!Array.isArray(props.catalogProducts)) return [];
+
+    return props.catalogProducts
+        .filter((item) => item && typeof item === 'object')
+        .map((item, index) => ({
+            name: typeof item.name === 'string' ? item.name : `Product ${index + 1}`,
+            quantity: Number.isFinite(Number(item.quantity)) ? Number(item.quantity) : 0,
+            unit: typeof item.unit === 'string' ? item.unit : '',
+            configured: item.configured === true,
+            manufacturers: Array.isArray(item.manufacturers)
+                ? item.manufacturers
+                    .filter((manufacturer) => manufacturer && typeof manufacturer === 'object')
+                    .map((manufacturer) => ({
+                        manufacturer: typeof manufacturer.manufacturer === 'string' ? manufacturer.manufacturer : 'Unknown',
+                        quantity: Number.isFinite(Number(manufacturer.quantity)) ? Number(manufacturer.quantity) : 0,
+                        configured: manufacturer.configured === true,
+                        shared_stock: manufacturer.shared_stock === true,
+                        size_codes: Array.isArray(manufacturer.size_codes)
+                            ? manufacturer.size_codes
+                                .filter((spec) => spec && typeof spec === 'object')
+                                .map((spec) => ({
+                                    code: typeof spec.code === 'string' ? spec.code : 'Unknown',
+                                    quantity: Number.isFinite(Number(spec.quantity)) ? Number(spec.quantity) : 0,
+                                    unit: typeof spec.unit === 'string' ? spec.unit : '',
+                                    configured: spec.configured === true,
+                                }))
+                            : [],
+                    }))
+                : [],
+        }));
+});
+const canViewCatalog = computed(() => props.can?.viewProducts === true);
 const widgets = reactive({ ...props.widgetPreferences });
 const widgetDraft = ref({});
 const showCustomizeModal = ref(false);
@@ -267,6 +304,39 @@ const ordersStatusIcon = (status) => (status === 'delivered' ? Check : status ==
             </section>
             <PluginSlot slot="after-stats" :components="pluginComponents.afterStats" />
             <PluginSlot slot="before-content" :components="pluginComponents.beforeContent" />
+
+            <section v-if="catalogInventory.length && canViewCatalog" class="dashboard-panel" aria-labelledby="catalog-stock-title">
+                <div class="dashboard-panel-heading">
+                    <h2 id="catalog-stock-title">Inventory by internal product</h2>
+                </div>
+                <ul class="dashboard-category-list">
+                    <li v-for="item in catalogInventory" :key="item.name" class="dashboard-category-row">
+                        <details>
+                            <summary class="flex cursor-pointer items-center justify-between gap-4">
+                                <strong>{{ item.name }}</strong>
+                                <span v-if="item.configured">{{ formatPlainNumber(item.quantity) }} {{ item.unit || '' }}</span>
+                                <span v-else class="text-text-tertiary">Master product not configured</span>
+                            </summary>
+                            <div v-if="item.manufacturers.length" class="mt-3 space-y-2 pl-4">
+                                <div v-for="manufacturer in item.manufacturers" :key="manufacturer.manufacturer" class="text-sm">
+                                    <div class="flex justify-between gap-4">
+                                        <span>{{ manufacturer.manufacturer }}</span>
+                                        <span v-if="manufacturer.shared_stock" class="text-text-tertiary">Stock not separated by manufacturer</span>
+                                        <span v-else-if="manufacturer.configured">{{ formatPlainNumber(manufacturer.quantity) }} {{ item.unit || '' }}</span>
+                                        <span v-else class="text-text-tertiary">Unlinked</span>
+                                    </div>
+                                    <div v-for="spec in manufacturer.size_codes" :key="`${manufacturer.manufacturer}-${spec.code}`" class="ml-4 flex justify-between text-text-tertiary">
+                                        <span>{{ spec.code }}</span>
+                                        <span v-if="spec.configured">{{ formatPlainNumber(spec.quantity) }} {{ spec.unit || item.unit || '' }}</span>
+                                        <span v-else>Unlinked</span>
+                                    </div>
+                                </div>
+                            </div>
+                            <p v-else class="mt-3 pl-4 text-sm text-text-tertiary">No confirmed manufacturer mappings yet.</p>
+                        </details>
+                    </li>
+                </ul>
+            </section>
 
             <section
                 v-if="widgets.low_stock_alerts"

@@ -19,6 +19,19 @@ const { t } = useI18n();
 const props = defineProps({
     order: Object,
     products: Array,
+
+    // PESO barcodes already loaded against each order item.
+    // Format:
+    // {
+    //     123: [
+    //         { peso_item_id: 1, barcode: 'ABC123', status: 'received' }
+    //     ]
+    // }
+    loadedPesoBarcodes: {
+        type: Object,
+        default: () => ({}),
+    },
+
     // Waiting for approval: it cannot be shipped or delivered yet.
     awaitingApproval: { type: Boolean, default: false },
 });
@@ -35,15 +48,23 @@ const form = useForm({
     discount_type: props.order.discount_type ?? '',
     discount_value: props.order.discount_value != null ? parseFloat(props.order.discount_value) : null,
     notes: props.order.notes || '',
-    items: props.order.items.map(item => ({
-        id: item.id,
-        product_id: item.product_id,
-        product_variant_id: item.product_variant_id ?? null,
-        quantity: item.quantity,
-        unit_price: parseFloat(item.unit_price),
-        discount_type: item.discount_type ?? '',
-        discount_value: item.discount_value != null ? parseFloat(item.discount_value) : null,
-    })),
+  items: props.order.items.map(item => ({
+    id: item.id,
+    product_id: item.product_id,
+    product_variant_id: item.product_variant_id ?? null,
+    quantity: item.quantity,
+    unit_price: parseFloat(item.unit_price),
+    discount_type: item.discount_type ?? '',
+    discount_value: item.discount_value != null
+        ? parseFloat(item.discount_value)
+        : null,
+
+    loadedPesoBarcodes: props.loadedPesoBarcodes[item.id] ?? [],
+    partialBarcodeSales: !!item.product?.partial_barcode_sales,
+
+    // MUST EXIST HERE
+    release_barcode_ids: [],
+})),
 });
 
 const selectedCustomer = ref(props.order.customer ?? null);
@@ -73,7 +94,95 @@ const variantsFor = (item) => {
     return product.variants.filter(v => v.is_active || v.id === item.product_variant_id);
 };
 
+const requiredReleaseCount = (item) => {
+    if (item.partialBarcodeSales) return 0;
+    const loadedCount = item.loadedPesoBarcodes?.length ?? 0;
+    const newQuantity = Number(item.quantity) || 0;
+
+    return Math.max(0, loadedCount - newQuantity);
+};
+
+const releaseSelectionError = (item) => {
+    const required = requiredReleaseCount(item);
+    const selected = item.release_barcode_ids?.length ?? 0;
+
+    if (required === 0) {
+        return '';
+    }
+
+    if (selected !== required) {
+        return `Select exactly ${required} barcode${required === 1 ? '' : 's'} to release.`;
+    }
+
+    return '';
+};
+const toggleBarcodeRelease = (item, barcodeId, event) => {
+    if (!Array.isArray(item.release_barcode_ids)) {
+        item.release_barcode_ids = [];
+    }
+
+    const checked = event.target.checked;
+
+    if (checked) {
+        if (!item.release_barcode_ids.includes(barcodeId)) {
+            item.release_barcode_ids.push(barcodeId);
+        }
+    } else {
+        item.release_barcode_ids =
+            item.release_barcode_ids.filter(id => id !== barcodeId);
+    }
+
+    console.log('Barcode release selection:', {
+        orderItemId: item.id,
+        barcodeId,
+        checked,
+        release_barcode_ids: [...item.release_barcode_ids],
+    });
+};
 const submit = () => {
+    for (const item of form.items) {
+        if (item.partialBarcodeSales) continue;
+        const required = requiredReleaseCount(item);
+        const selected = item.release_barcode_ids?.length ?? 0;
+
+        if (required > 0 && selected !== required) {
+            return;
+        }
+
+        if (!Array.isArray(item.release_barcode_ids)) {
+            item.release_barcode_ids = [];
+        }
+    }
+
+    console.log(
+        'FINAL SUBMIT DATA:',
+        JSON.stringify(form.items, null, 2)
+    );
+
+    const transformOrderUpdate = (data) => ({
+        ...data,
+
+        items: data.items.map((item) => ({
+            id: item.id,
+            product_id: item.product_id,
+            product_variant_id: item.product_variant_id ?? null,
+            quantity: Number(item.quantity),
+            unit_price: Number(item.unit_price),
+            discount_type: item.discount_type || null,
+            discount_value:
+                item.discount_value !== null &&
+                item.discount_value !== ''
+                    ? Number(item.discount_value)
+                    : null,
+
+            release_barcode_ids: Array.isArray(item.release_barcode_ids)
+                ? item.release_barcode_ids.map(Number)
+                : [],
+            partial_barcode_sales: item.partialBarcodeSales,
+        })),
+    });
+
+    form.transform(transformOrderUpdate);
     form.put(route('orders.update', props.order.id), {
         preserveScroll: true,
     });
@@ -95,6 +204,12 @@ const addItem = () => {
 };
 
 const removeItem = (index) => {
+    const item = form.items[index];
+
+    if (item.loadedPesoBarcodes?.length > 0) {
+        return;
+    }
+
     form.items.splice(index, 1);
 };
 
@@ -246,8 +361,8 @@ const fieldError = 'mt-1 text-xs text-status-danger';
                                                 :id="`quantity-${index}`"
                                                 v-model.number="item.quantity"
                                                 type="number"
-                                                min="1"
-                                                step="1"
+                                                :min="productFor(item.product_id)?.partial_barcode_sales ? productFor(item.product_id).minimum_sale_quantity : 1"
+                                                :step="productFor(item.product_id)?.partial_barcode_sales ? productFor(item.product_id).sale_increment : 1"
                                                 :class="fieldInput"
                                                 required
                                             />
@@ -255,6 +370,90 @@ const fieldError = 'mt-1 text-xs text-status-danger';
                                                 {{ form.errors[`items.${index}.quantity`] }}
                                             </p>
                                         </div>
+
+<!-- PESO loaded barcodes / release selection -->
+<div
+    v-if="item.loadedPesoBarcodes && item.loadedPesoBarcodes.length > 0"
+    class="mt-3 rounded-md border border-border-subtle bg-surface-sunken p-3 md:col-span-12"
+>
+    <div class="mb-2 flex items-center justify-between">
+        <div>
+            <p class="text-sm font-medium text-text-primary">
+                PESO Loaded Barcodes
+            </p>
+
+            <p class="text-xs text-text-tertiary" v-if="!item.partialBarcodeSales">
+                Loaded: {{ item.loadedPesoBarcodes.length }}
+                · New quantity: {{ item.quantity }}
+            </p>
+            <p v-else class="text-xs text-text-tertiary">
+                Loaded quantity: {{ item.loadedPesoBarcodes.reduce((sum, barcode) => sum + Number(barcode.allocated_quantity || 0), 0) }} {{ productFor(item.product_id)?.base_inventory_unit || 'units' }}
+                · New quantity: {{ item.quantity }}
+            </p>
+        </div>
+
+        <span
+            v-if="item.partialBarcodeSales"
+            class="text-xs font-medium text-text-secondary"
+        >
+            Quantity releases are automatic
+        </span>
+        <span
+            v-else-if="requiredReleaseCount(item) === 0"
+            class="text-xs font-medium text-status-success"
+        >
+            No release required
+        </span>
+
+        <span
+            v-else
+            class="text-xs font-medium text-status-warning"
+        >
+            Release {{ requiredReleaseCount(item) }}
+        </span>
+    </div>
+
+    <div v-if="!item.partialBarcodeSales" class="space-y-2">
+        <label
+            v-for="barcode in item.loadedPesoBarcodes"
+            :key="barcode.peso_item_id"
+            class="flex cursor-pointer items-center gap-3 rounded-md border border-border-subtle bg-surface-canvas px-3 py-2"
+        >
+
+  <input
+    type="checkbox"
+    :checked="item.release_barcode_ids.includes(Number(barcode.peso_item_id))"
+    :disabled="requiredReleaseCount(item) === 0"
+    @change="toggleBarcodeRelease(item, Number(barcode.peso_item_id), $event)"
+    class="h-4 w-4 rounded border-border-subtle"
+/>
+
+            <div class="min-w-0 flex-1">
+                <p class="break-all font-mono text-xs text-text-primary">
+                    {{ barcode.barcode }}
+                </p>
+
+                <p class="mt-0.5 text-xs text-text-tertiary">
+                    Status: {{ barcode.status }}
+                </p>
+            </div>
+        </label>
+    </div>
+
+    <div v-else class="space-y-2">
+        <div v-for="barcode in item.loadedPesoBarcodes" :key="barcode.peso_item_id" class="rounded-md border border-border-subtle bg-surface-canvas px-3 py-2">
+            <p class="break-all font-mono text-xs text-text-primary">{{ barcode.barcode }}</p>
+            <p class="mt-0.5 text-xs text-text-tertiary">{{ barcode.allocated_quantity }} {{ barcode.base_unit || productFor(item.product_id)?.base_inventory_unit }}</p>
+        </div>
+    </div>
+
+    <p
+        v-if="releaseSelectionError(item)"
+        class="mt-2 text-xs text-status-danger"
+    >
+        {{ releaseSelectionError(item) }}
+    </p>
+</div>
 
                                         <!-- Unit price -->
                                         <div class="md:col-span-2">
@@ -285,12 +484,16 @@ const fieldError = 'mt-1 text-xs text-status-danger';
 
                                         <!-- Remove button -->
                                         <div class="flex items-end md:col-span-1">
-                                            <button :aria-label="t('common.delete')"
-                                                type="button"
-                                                @click="removeItem(index)"
-                                                class="rounded-md p-1.5 text-text-tertiary transition-colors hover:bg-surface-sunken hover:text-status-danger"
-                                                :title="t('orders.edit.removeItem')"
-                                            >
+                                           <button
+    :aria-label="t('common.delete')"
+    type="button"
+    @click="removeItem(index)"
+    :disabled="item.loadedPesoBarcodes?.length > 0"
+    class="rounded-md p-1.5 text-text-tertiary transition-colors hover:bg-surface-sunken hover:text-status-danger disabled:cursor-not-allowed disabled:opacity-40"
+    :title="item.loadedPesoBarcodes?.length > 0
+        ? 'Cannot remove an item with loaded PESO barcodes'
+        : t('orders.edit.removeItem')"
+>
                                                 <Trash2 :size="16" />
                                             </button>
                                         </div>

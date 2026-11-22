@@ -99,6 +99,13 @@ const form = useForm({
     has_variants: props.product.has_variants || false,
     tracking_type: props.product.tracking_type || 'none',
     peso_barcode_managed: !!props.product.peso_barcode_managed,
+    base_inventory_unit: props.product.base_inventory_unit || 'unit',
+    partial_barcode_sales: !!props.product.partial_barcode_sales,
+    minimum_sale_quantity: props.product.minimum_sale_quantity || 1,
+    sale_increment: props.product.sale_increment || 1,
+    billing_unit: props.product.billing_unit || '',
+    billing_conversion: props.product.billing_conversion ? JSON.stringify(props.product.billing_conversion) : '',
+    packaging_conversions: props.product.packaging_conversions ? JSON.stringify(props.product.packaging_conversions) : '',
     type: props.product.type || 'standard',
     options: prepareExistingOptions(),
     variants: prepareExistingVariants(),
@@ -478,6 +485,45 @@ const fieldError = 'mt-1 text-xs text-status-danger';
                             </select>
                             <p class="mt-1 text-xs text-text-tertiary">{{ t('products.form.inventoryTrackingHint') }}</p>
                             <p v-if="form.errors.tracking_type" :class="fieldError">{{ form.errors.tracking_type }}</p>
+                        </div>
+                        <div class="md:col-span-2 rounded-lg border border-border-subtle p-4">
+                            <h3 class="text-sm font-semibold text-text-primary">Quantity and barcode rules</h3>
+                            <div class="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2">
+                                <div>
+                                    <label for="base_inventory_unit" :class="fieldLabel">Base inventory unit</label>
+                                    <input id="base_inventory_unit" v-model="form.base_inventory_unit" maxlength="32" :class="fieldInput" required />
+                                    <p v-if="form.errors.base_inventory_unit" :class="fieldError">{{ form.errors.base_inventory_unit }}</p>
+                                </div>
+                                <div class="flex items-center gap-2 pt-5">
+                                    <input id="partial_barcode_sales" v-model="form.partial_barcode_sales" type="checkbox" class="h-4 w-4 rounded border-border-default text-brand" />
+                                    <label for="partial_barcode_sales" class="text-sm text-text-primary">Allow partial barcode quantity sales</label>
+                                </div>
+                                <div>
+                                    <label for="minimum_sale_quantity" :class="fieldLabel">Minimum sale quantity</label>
+                                    <input id="minimum_sale_quantity" v-model.number="form.minimum_sale_quantity" type="number" min="1" step="1" :class="fieldInput" required />
+                                    <p v-if="form.errors.minimum_sale_quantity" :class="fieldError">{{ form.errors.minimum_sale_quantity }}</p>
+                                </div>
+                                <div>
+                                    <label for="sale_increment" :class="fieldLabel">Sale increment</label>
+                                    <input id="sale_increment" v-model.number="form.sale_increment" type="number" min="1" step="1" :class="fieldInput" required />
+                                    <p v-if="form.errors.sale_increment" :class="fieldError">{{ form.errors.sale_increment }}</p>
+                                </div>
+                                <div>
+                                    <label for="billing_unit" :class="fieldLabel">Billing unit (optional)</label>
+                                    <input id="billing_unit" v-model="form.billing_unit" maxlength="32" :class="fieldInput" />
+                                </div>
+                                <div>
+                                    <label for="billing_conversion" :class="fieldLabel">Billing conversion JSON (optional)</label>
+                                    <textarea id="billing_conversion" v-model="form.billing_conversion" rows="2" :class="fieldArea" placeholder='{"numerator": 9, "denominator": 1}'></textarea>
+                                    <p v-if="form.errors.billing_conversion" :class="fieldError">{{ form.errors.billing_conversion }}</p>
+                                </div>
+                                <div class="md:col-span-2">
+                                    <label for="packaging_conversions" :class="fieldLabel">Packaging conversions JSON (optional)</label>
+                                    <textarea id="packaging_conversions" v-model="form.packaging_conversions" rows="2" :class="fieldArea" placeholder='{"roll":{"quantity":375,"unit":"m"},"box":{"quantity":1500,"unit":"m"}}'></textarea>
+                                    <p v-if="form.errors.packaging_conversions" :class="fieldError">{{ form.errors.packaging_conversions }}</p>
+                                </div>
+                            </div>
+                            <p class="mt-2 text-xs text-text-tertiary">Billing conversion data is stored for later use; it does not change order totals yet.</p>
                         </div>
                     </div>
                     <!-- PESO Barcode Management -->

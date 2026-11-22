@@ -67,6 +67,7 @@ final class ReceivingService
                 ->where('warehouse_id', $warehouseId)
                 ->where('barcode', $barcode)
                 ->whereIn('status', ['expected', 'received'])
+                ->lockForUpdate()
                 ->latest('id')
                 ->first();
 
@@ -92,6 +93,8 @@ final class ReceivingService
                     'received_at' => now(),
                 ]);
 
+                app(PesoStockReceiptService::class)->receive($pesoItem, $userId);
+
                 // Keep the parent PESO shipment receiving summary
                 // synchronized with the actual received PESO items.
                 $shipment = PesoShipment::query()
@@ -100,11 +103,13 @@ final class ReceivingService
                 if ($shipment !== null) {
                     $receivedPackages = PesoItem::query()
                         ->where('peso_shipment_id', $shipment->id)
+                        ->where('barcode_level', 'L1')
                         ->where('status', 'received')
                         ->count();
 
                     $totalPackages = PesoItem::query()
                         ->where('peso_shipment_id', $shipment->id)
+                        ->where('barcode_level', 'L1')
                         ->count();
 
                     $shipment->update([
@@ -118,6 +123,43 @@ final class ReceivingService
                 return $scan->fresh([
                     'pesoItem',
                     'pesoShipment',
+                ]);
+            }
+
+            if ($pesoItem !== null && $pesoItem->status === 'received') {
+                return ReceivingScan::create([
+                    'organization_id' => $organizationId,
+                    'warehouse_id' => $warehouseId,
+                    'barcode' => $barcode,
+                    'status' => 'DUPLICATE',
+                    'scanned_by' => $userId,
+                    'scanned_at' => now(),
+                    'peso_item_id' => $pesoItem->id,
+                    'peso_shipment_id' => $pesoItem->peso_shipment_id,
+                    'notes' => 'Barcode is already marked received in this godown.',
+                ]);
+            }
+
+            $otherWarehouseItem = PesoItem::query()
+                ->where('organization_id', $organizationId)
+                ->where('barcode', $barcode)
+                ->where('warehouse_id', '!=', $warehouseId)
+                ->whereIn('status', ['expected', 'received'])
+                ->lockForUpdate()
+                ->latest('id')
+                ->first();
+
+            if ($otherWarehouseItem !== null) {
+                return ReceivingScan::create([
+                    'organization_id' => $organizationId,
+                    'warehouse_id' => $warehouseId,
+                    'barcode' => $barcode,
+                    'status' => 'REJECTED',
+                    'scanned_by' => $userId,
+                    'scanned_at' => now(),
+                    'peso_item_id' => $otherWarehouseItem->id,
+                    'peso_shipment_id' => $otherWarehouseItem->peso_shipment_id,
+                    'notes' => "Barcode belongs to warehouse {$otherWarehouseItem->warehouse_id}, not warehouse {$warehouseId}.",
                 ]);
             }
 

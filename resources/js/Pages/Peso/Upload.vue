@@ -73,7 +73,7 @@ const submit = () => {
                     <button
                         type="submit"
                         :disabled="!form.re12_pdf || form.processing"
-                        class="w-full py-2.5 px-4 rounded-md bg-blue-600 hover:bg-blue-700 text-white font-medium text-sm transition disabled:opacity-50"
+                        class="w-full py-2.5 px-4 rounded-md bg-brand hover:opacity-90 text-white font-medium text-sm transition disabled:opacity-50"
                     >
                         {{ form.processing ? "Parsing Pass..." : "Ingest RE-12 Consignment" }}
                     </button>

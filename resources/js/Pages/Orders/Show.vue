@@ -142,6 +142,7 @@ const submitApproval = () => {
 
 const statusVariant = orderStatusVariant;
 const loadingBarcode = ref('');
+const loadingSelectedItemId = ref(Number(props.order.items?.[0]?.id) || null);
 const loadingMessage = ref('');
 const loadingError = ref('');
 const loadingProcessing = ref(false);
@@ -182,6 +183,8 @@ const loadExistingBarcodes = async () => {
             barcode: item.barcode,
             peso_item_id: item.peso_item_id,
             order_item_id: item.order_item_id,
+            allocated_quantity: item.allocated_quantity,
+            base_unit: item.base_unit,
             scanned_at: item.scanned_at
                 ? new Date(item.scanned_at).toLocaleTimeString()
                 : '',
@@ -218,17 +221,29 @@ const loadingOrderItems = computed(() => {
     const items = props.order.items || [];
 
     return items.map((item) => {
-        const loadedCount = loadedBarcodes.value.filter(
+        const lineBarcodes = loadedBarcodes.value.filter(
             (barcode) =>
                 Number(barcode.order_item_id) === Number(item.id)
-        ).length;
+        );
+        const partial = !!item.product?.partial_barcode_sales;
+        const loadedCount = partial
+            ? lineBarcodes.reduce((sum, barcode) => sum + Number(barcode.allocated_quantity || 0), 0)
+            : lineBarcodes.length;
 
         return {
             ...item,
+            partial_barcode_sales: partial,
             loaded_count: loadedCount,
+            loading_unit: partial ? item.product?.base_inventory_unit : 'barcode(s)',
         };
     });
 });
+
+const selectedLoadingItem = computed(() => loadingOrderItems.value.find(item => Number(item.id) === Number(loadingSelectedItemId.value)) ?? null);
+const selectedLoadingOutstanding = computed(() => selectedLoadingItem.value
+    ? Math.max(0, Number(selectedLoadingItem.value.quantity) - Number(selectedLoadingItem.value.loaded_count))
+    : 0);
+const allOrderLinesLoaded = computed(() => loadingOrderItems.value.length > 0 && loadingOrderItems.value.every(item => item.loaded_count === Number(item.quantity)));
 
 const scanLoadingBarcode = async () => {
     const barcode = loadingBarcode.value.trim();
@@ -252,7 +267,7 @@ const scanLoadingBarcode = async () => {
             },
             body: JSON.stringify({
                 warehouse_id: props.order.warehouse_id,
-                order_item_id: props.order.items[0]?.id,
+                order_item_id: loadingSelectedItemId.value,
                 barcode,
             }),
         });
@@ -267,6 +282,8 @@ const scanLoadingBarcode = async () => {
             barcode: data.barcode,
             peso_item_id: data.peso_item_id,
             order_item_id: data.order_item_id,
+            allocated_quantity: data.allocated_quantity,
+            base_unit: data.base_unit,
             scanned_at: new Date().toLocaleTimeString(),
         });
 
@@ -457,38 +474,47 @@ const formatOrderDate = (date, long = false) =>
             Loading / Dispatch
         </h3>
 
-        <p class="mt-1 text-xs text-text-tertiary">
-            Scan the actual manufacturer barcode when the physical box is loaded.
-        </p>
+        <p class="mt-1 text-xs text-text-tertiary">Scan the actual manufacturer barcode when the physical package is loaded.</p>
     </div>
 
     <div class="p-5">
         <div class="rounded-lg border border-border-subtle bg-surface-canvas p-4">
-            <div class="flex flex-wrap items-center justify-between gap-3">
+            <div class="mb-4">
+                <label for="loading_order_item" class="mb-1 block text-sm font-medium text-text-secondary">Order line</label>
+                <select id="loading_order_item" v-model.number="loadingSelectedItemId" class="h-10 w-full rounded-md border border-border-subtle bg-surface-canvas px-3 text-sm" :disabled="loadingProcessing">
+                    <option v-for="item in loadingOrderItems" :key="item.id" :value="item.id">
+                        {{ item.product_name }} — {{ item.quantity }} {{ item.loading_unit }} (loaded {{ item.loaded_count }})
+                    </option>
+                </select>
+            </div>
+            <div v-if="selectedLoadingItem" class="flex flex-wrap items-center justify-between gap-3">
                 <div>
                     <p class="text-sm font-medium text-text-primary">
-                        {{ order.items[0].product_name }}
+                        {{ selectedLoadingItem.product_name }}
                     </p>
 
                     <p class="mt-1 text-xs text-text-secondary">
                         Ordered quantity:
-                        <span class="font-semibold">{{ order.items[0].quantity }}</span>
+                        <span class="font-semibold">{{ selectedLoadingItem.quantity }} {{ selectedLoadingItem.loading_unit }}</span>
                     </p>
 
                     <p class="mt-1 text-xs text-text-secondary">
                         Loaded:
-                        <span class="font-semibold">{{ loadedBarcodes.length }}</span>
+                        <span class="font-semibold">{{ selectedLoadingItem.loaded_count }}</span>
                         /
-                        <span class="font-semibold">{{ order.items[0].quantity }}</span>
+                        <span class="font-semibold">{{ selectedLoadingItem.quantity }} {{ selectedLoadingItem.loading_unit }}</span>
+                    </p>
+                    <p v-if="selectedLoadingItem.partial_barcode_sales && selectedLoadingOutstanding > 0" class="mt-1 text-xs text-text-tertiary">
+                        This barcode scan will allocate {{ selectedLoadingOutstanding }} {{ selectedLoadingItem.loading_unit }}. The same manufacturer barcode remains the stock identity.
                     </p>
                 </div>
 
                 <Badge
-                    :variant="loadedBarcodes.length >= Number(order.items[0].quantity) ? 'success' : 'warning'"
+                    :variant="selectedLoadingItem.loaded_count >= Number(selectedLoadingItem.quantity) ? 'success' : 'warning'"
                     size="sm"
                     dot
                 >
-                    {{ loadedBarcodes.length >= Number(order.items[0].quantity) ? 'Complete' : 'Pending' }}
+                    {{ selectedLoadingItem.loaded_count >= Number(selectedLoadingItem.quantity) ? 'Complete' : 'Pending' }}
                 </Badge>
             </div>
 
@@ -508,13 +534,11 @@ const formatOrderDate = (date, long = false) =>
                     autofocus
                     placeholder="Scan barcode..."
                     class="h-11 w-full rounded-md border border-border-subtle bg-surface-canvas px-3 text-sm text-text-primary placeholder:text-text-tertiary ds-focus-ring"
-                    :disabled="loadingProcessing || loadedBarcodes.length >= Number(order.items[0].quantity)"
+                    :disabled="loadingProcessing || !selectedLoadingItem || selectedLoadingItem.loaded_count >= Number(selectedLoadingItem.quantity)"
                     @keyup.enter="scanLoadingBarcode"
                 />
 
-                <p class="mt-2 text-xs text-text-tertiary">
-                    Use the physical box barcode. Stock is not reduced again during loading.
-                </p>
+                <p class="mt-2 text-xs text-text-tertiary">Use the physical manufacturer barcode. Stock is not reduced again during loading.</p>
             </div>
 
             <div
@@ -550,6 +574,7 @@ const formatOrderDate = (date, long = false) =>
 
                         <p class="mt-1 text-xs text-text-tertiary">
                             Scanned {{ item.scanned_at }}
+                            <template v-if="item.allocated_quantity"> · {{ item.allocated_quantity }} {{ item.base_unit }}</template>
                         </p>
                     </div>
 
@@ -592,19 +617,14 @@ const formatOrderDate = (date, long = false) =>
             class="mt-4 rounded-lg border border-border-subtle bg-surface-canvas p-4"
         >
             <p class="text-sm text-text-secondary">
-                {{
-                    loadedBarcodes.length >= Number(order.items?.[0]?.quantity || 0)
-                        ? 'All required manufacturer barcodes have been loaded.'
-                        : `Load all required manufacturer barcodes before approving this order.`
-                }}
+                {{ allOrderLinesLoaded ? 'All order item quantities have been loaded.' : 'Load each order item quantity before approving this order.' }}
             </p>
 
             <div class="mt-3 flex items-center justify-between gap-3">
                 <div class="text-sm font-medium text-text-primary">
-                    Loaded:
-                    {{ loadedBarcodes.length }}
-                    /
-                    {{ order.items?.[0]?.quantity || 0 }}
+                    <span v-for="item in loadingOrderItems" :key="item.id" class="me-3">
+                        {{ item.product_name }}: {{ item.loaded_count }}/{{ item.quantity }} {{ item.loading_unit }}
+                    </span>
                 </div>
 
                 <Button
@@ -612,7 +632,7 @@ const formatOrderDate = (date, long = false) =>
                     variant="default"
                     :disabled="
                         processing ||
-                        loadedBarcodes.length !== Number(order.items?.[0]?.quantity || 0)
+                        !allOrderLinesLoaded
                     "
                     @click="openApprovalModal('approve')"
                 >
@@ -621,7 +641,7 @@ const formatOrderDate = (date, long = false) =>
             </div>
 
             <p
-                v-if="loadedBarcodes.length !== Number(order.items?.[0]?.quantity || 0)"
+                v-if="!allOrderLinesLoaded"
                 class="mt-2 text-xs text-status-warning"
             >
                 Approval is available only after all required barcodes are loaded.
@@ -1158,8 +1178,7 @@ const formatOrderDate = (date, long = false) =>
                     class="rounded-lg border border-status-success/20 bg-status-success-soft p-3 text-sm"
                 >
                     <p class="font-medium text-status-success">
-                        Loaded: {{ loadedBarcodes.length }} /
-                        {{ order.items?.[0]?.quantity || 0 }}
+                        {{ allOrderLinesLoaded ? 'All order item quantities are loaded.' : 'Some order item quantities are still pending.' }}
                     </p>
 
                     <p class="mt-1 text-xs text-text-secondary">
@@ -1201,7 +1220,7 @@ const formatOrderDate = (date, long = false) =>
                     :loading="processing"
                     :disabled="
                         processing ||
-                        loadedBarcodes.length !== Number(order.items?.[0]?.quantity || 0)
+                        !allOrderLinesLoaded
                     "
                     @click="submitApproval"
                 >

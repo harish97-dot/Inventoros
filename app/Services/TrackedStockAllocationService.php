@@ -58,7 +58,7 @@ final class TrackedStockAllocationService
 
     // PESO-managed products use the physical manufacturer barcode
     // during loading/dispatch, not automatic serial allocation at order creation.
-    if ($product->peso_barcode_managed) {
+        if ($product->peso_barcode_managed || $product->partial_barcode_sales) {
         return 0;
     }
 

@@ -361,7 +361,14 @@ const fieldError = 'mt-1 text-xs text-status-danger';
                                     </div>
                                     <div class="md:col-span-3">
                                         <label :for="fieldIdPrefix + '-1'" :class="fieldLabel">{{ t('common.quantity') }}</label>
-                                        <input :id="fieldIdPrefix + '-1'" v-model.number="quantity" type="number" min="1" :class="fieldInput" />
+                                        <input
+                                            :id="fieldIdPrefix + '-1'"
+                                            v-model.number="quantity"
+                                            type="number"
+                                            :min="chosenProduct?.partial_barcode_sales ? chosenProduct.minimum_sale_quantity : 1"
+                                            :step="chosenProduct?.partial_barcode_sales ? chosenProduct.sale_increment : 1"
+                                            :class="fieldInput"
+                                        />
                                     </div>
                                     <div class="flex items-end md:col-span-2">
                                         <Button type="button" variant="default" class="w-full" @click="addItem">

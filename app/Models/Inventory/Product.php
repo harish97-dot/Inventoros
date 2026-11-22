@@ -118,6 +118,13 @@ class Product extends Model
         'has_variants',
         'tracking_type',
         'peso_barcode_managed',
+        'base_inventory_unit',
+        'partial_barcode_sales',
+        'minimum_sale_quantity',
+        'sale_increment',
+        'billing_unit',
+        'billing_conversion',
+        'packaging_conversions',
         'metadata',
     ];
 
@@ -159,7 +166,24 @@ class Product extends Model
             'images' => 'array',
             'image_disks' => 'array',
             'peso_barcode_managed' => 'boolean',
+            'partial_barcode_sales' => 'boolean',
+            'minimum_sale_quantity' => 'integer',
+            'sale_increment' => 'integer',
+            'billing_conversion' => 'array',
+            'packaging_conversions' => 'array',
         ];
+    }
+
+    public function acceptsSaleQuantity(int $quantity): bool
+    {
+        if (! $this->partial_barcode_sales) {
+            return true;
+        }
+
+        $minimum = max(1, (int) $this->minimum_sale_quantity);
+        $increment = max(1, (int) $this->sale_increment);
+
+        return $quantity >= $minimum && (($quantity - $minimum) % $increment) === 0;
     }
 
     /**

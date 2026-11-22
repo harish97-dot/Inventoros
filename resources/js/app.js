@@ -95,20 +95,34 @@ createInertiaApp({
         // ---------------------------------------------------------
         const pagePath = `./Pages/${name}.vue`;
 
-        const pageComponent = pages[pagePath];
+// First try the exact Vite glob key.
+let pageComponent = pages[pagePath];
 
-        if (pageComponent) {
-            return pageComponent;
-        }
+// If the exact key is not present, find the page by its
+// normalized Pages/... path. This makes the resolver work
+// regardless of how Vite represents the glob key.
+if (!pageComponent) {
+    const normalizedPath = `Pages/${name}.vue`;
 
-        console.error('Inertia page resolution failed:', {
-            name,
-            pagePath,
-            availablePages: Object.keys(pages).slice(0, 20),
-            totalPages: Object.keys(pages).length,
-        });
+    const matchedEntry = Object.entries(pages).find(
+        ([path]) => path.replace(/^.*?Pages\//, 'Pages/') === normalizedPath
+    );
 
-        throw new Error(`Page not found: ${pagePath}`);
+    pageComponent = matchedEntry?.[1];
+}
+
+if (pageComponent) {
+    return pageComponent;
+}
+
+console.error('Inertia page resolution failed:', {
+    name,
+    pagePath,
+    availablePages: Object.keys(pages).slice(0, 50),
+    totalPages: Object.keys(pages).length,
+});
+
+throw new Error(`Page not found: ${pagePath}`);
     },
 
     async setup({ el, App, props, plugin }) {

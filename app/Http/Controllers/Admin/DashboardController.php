@@ -12,6 +12,7 @@ use App\Models\Inventory\Product;
 use App\Models\Inventory\ProductCategory;
 use App\Models\Inventory\ProductLocation;
 use App\Models\Inventory\StockAdjustment;
+use App\Models\PesoProductMapping;
 use App\Models\Order\Order;
 use App\Models\User;
 use App\Services\PluginUIService;
@@ -227,6 +228,64 @@ class DashboardController extends Controller
             })
             ->values();
 
+        $catalogProducts = collect();
+        if ($canViewProducts) {
+            $classificationNames = ['BOOSTER', 'POWER GEL', 'D-CORD', 'EXCEL', 'ED'];
+            $mappings = PesoProductMapping::query()
+                ->where('organization_id', $orgId)
+                ->with(['product', 'productVariant'])
+                ->get();
+            $catalogProducts = collect($classificationNames)->map(function (string $name) use ($mappings) {
+                $rows = $mappings->where('internal_product_name', $name)->values();
+                $quantityFor = static function (PesoProductMapping $mapping): ?int {
+                    if ($mapping->productVariant !== null) return (int) $mapping->productVariant->stock;
+                    if ($mapping->product !== null) return (int) $mapping->product->total_stock;
+                    return null;
+                };
+                $targets = $rows->mapWithKeys(function (PesoProductMapping $mapping) use ($quantityFor) {
+                    $key = $mapping->product_variant_id !== null
+                        ? 'variant:'.$mapping->product_variant_id
+                        : ($mapping->product_id !== null ? 'product:'.$mapping->product_id : null);
+                    return $key === null ? [] : [$key => $quantityFor($mapping)];
+                });
+                $unit = $rows->first(fn (PesoProductMapping $mapping) => $mapping->product !== null)?->product?->base_inventory_unit;
+                $manufacturers = $rows->groupBy('manufacturer_name')->map(function ($manufacturerRows, string $manufacturer) use ($quantityFor, $rows, $name) {
+                    $targetIds = $manufacturerRows->map(fn (PesoProductMapping $mapping) => $mapping->product_variant_id !== null
+                        ? 'variant:'.$mapping->product_variant_id
+                        : ($mapping->product_id !== null ? 'product:'.$mapping->product_id : null))->filter()->unique();
+                    $shared = $targetIds->contains(fn (string $targetId) => str_starts_with($targetId, 'product:')
+                        && $rows->where('product_id', (int) substr($targetId, 8))->pluck('manufacturer_name')->unique()->count() > 1);
+                    $quantity = $shared ? null : $manufacturerRows->unique(fn (PesoProductMapping $mapping) => $mapping->product_variant_id !== null
+                        ? 'variant:'.$mapping->product_variant_id
+                        : ($mapping->product_id !== null ? 'product:'.$mapping->product_id : 'unlinked:'.$mapping->id))
+                        ->filter(fn (PesoProductMapping $mapping) => $quantityFor($mapping) !== null)
+                        ->sum(fn (PesoProductMapping $mapping) => $quantityFor($mapping));
+
+                    return [
+                        'manufacturer' => $manufacturer,
+                        'quantity' => $targetIds->isEmpty() || $shared ? null : $quantity,
+                        'configured' => $targetIds->isNotEmpty(),
+                        'shared_stock' => $shared,
+                        'size_codes' => $manufacturerRows->unique(fn (PesoProductMapping $mapping) => $mapping->re12_code ?? '')
+                            ->map(fn (PesoProductMapping $mapping) => [
+                                'code' => $mapping->re12_code,
+                                'quantity' => $quantityFor($mapping),
+                                'unit' => $mapping->product?->base_inventory_unit,
+                                'configured' => $mapping->product_id !== null || $mapping->product_variant_id !== null,
+                            ])->values(),
+                    ];
+                })->values();
+
+                return [
+                    'name' => $name,
+                    'quantity' => (int) $targets->unique()->sum(),
+                    'unit' => $unit,
+                    'configured' => $rows->contains(fn (PesoProductMapping $mapping) => $mapping->product_id !== null),
+                    'manufacturers' => $manufacturers,
+                ];
+            });
+        }
+
         // Get recent activity logs
         $recentActivity = ! $canViewActivity ? collect() : ActivityLog::where('organization_id', $user->organization_id)
             ->with('user')
@@ -354,6 +413,7 @@ class DashboardController extends Controller
             'reorderSuggestions' => $reorderSuggestions,
             'recentOrders' => $recentOrders,
             'stockByCategory' => $stockByCategory,
+            'catalogProducts' => $catalogProducts,
             'recentActivity' => $recentActivity,
             'can' => [
                 'viewProducts' => $canViewProducts,

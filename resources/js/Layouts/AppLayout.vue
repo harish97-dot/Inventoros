@@ -146,8 +146,20 @@ const sections = computed(() => [
             {
     icon: ClipboardList,
     name: 'PESO / RE-12',
+    href: route('peso.index'),
+    active: ['peso.index'],
+},
+{
+    icon: PackageSearch,
+    name: 'Pending Receiving',
+    href: route('peso.pending-receiving'),
+    active: ['peso.pending-receiving'],
+},
+{
+    icon: FileSpreadsheet,
+    name: 'Upload RE-12',
     href: route('peso.upload'),
-    active: ['peso.*'],
+    active: ['peso.upload'],
 },
             { icon: Truck, name: t('nav.suppliers'), href: route('suppliers.index'), active: ['suppliers.*'], perm: 'view_suppliers' },
             { icon: BadgeCheck, name: t('nav.approvals'), href: route('approvals.index'), active: ['approvals.*'], perm: ['approve_purchase_orders', 'approve_stock_adjustments', 'approve_stock_transfers'], badge: pendingApprovalsCount.value },

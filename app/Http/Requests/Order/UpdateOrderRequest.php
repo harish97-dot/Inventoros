@@ -48,6 +48,16 @@ final class UpdateOrderRequest extends FormRequest
             'items.*.unit_price' => 'required|numeric|decimal:0,2|min:0',
             'items.*.discount_type' => ['nullable', Rule::in(DiscountType::values())],
             'items.*.discount_value' => 'nullable|numeric|decimal:0,2|min:0|max:99999999',
+            'items.*.release_barcode_ids' => [
+    'nullable',
+    'array',
+],
+
+'items.*.release_barcode_ids.*' => [
+    'integer',
+    'distinct',
+    'exists:peso_items,id',
+],
         ];
     }
 }
